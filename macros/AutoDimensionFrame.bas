@@ -3,7 +3,7 @@ Option Explicit
 
 ' Requires SolidWorks type libraries (normal SolidWorks VBA macro project).
 ' Distances and coordinates are in metres. No document is saved automatically.
-Private Const MACRO_VERSION As String = "2.1"
+Private Const MACRO_VERSION As String = "2.2"
 Private Const LOG_PREFIX As String = "AutoFrameDim v" & MACRO_VERSION
 Private Const OFFSET_M As Double = 0.010
 Private Const OUTLINE_TOL_M As Double = 0.001
@@ -11,7 +11,6 @@ Private Const COORD_EQUAL_TOL_M As Double = 0.0001
 Private Const MIN_LENGTH_M As Double = 0.02
 Private Const MIN_PROJECTED_M As Double = 0.001
 Private Const LENGTH_TOL_M As Double = 0.000001
-Private Const MARKER_PREFIX As String = "AutoFrameDim:"
 
 Private swApp As SldWorks.SldWorks
 Private doc As SldWorks.ModelDoc2
@@ -57,24 +56,11 @@ Public Sub main()
     If IsEmpty(comps) Then Err.Raise vbObjectError + 7, , "No visible assembly components. Part-only views are not supported."
     If Not IsArray(comps) Then Err.Raise vbObjectError + 8, , "Visible component array unavailable."
 
-    Dim props As SldWorks.CustomPropertyManager, marker As String
-    Set props = doc.Extension.CustomPropertyManager("")
-    Dim drawing As SldWorks.DrawingDoc, sheet As SldWorks.Sheet
-    Set drawing = doc
-    Set sheet = drawing.GetCurrentSheet
-    marker = MARKER_PREFIX & sheet.GetName & ":" & targetView.GetName2
-    If HasProperty(props, marker) Then Err.Raise vbObjectError + 9, , "This view already has an AutoFrameDim run marker. See README before repeating."
-
     oldInputPreference = CBool(swApp.GetUserPreferenceToggle(swInputDimValOnCreate))
     preferenceCaptured = True
     swApp.SetUserPreferenceToggle swInputDimValOnCreate, False
     If CBool(swApp.GetUserPreferenceToggle(swInputDimValOnCreate)) Then _
         Err.Raise vbObjectError + 17, , "Cannot disable dimension value input preference."
-
-    ' Persist a guard BEFORE annotation mutation; interrupted runs cannot duplicate.
-    Dim result As Long
-    result = props.Add3(marker, swCustomInfoText, "Started " & CStr(Now), swCustomPropertyOnlyIfNew)
-    If Not HasProperty(props, marker) Then Err.Raise vbObjectError + 10, , "Cannot create repeat-run guard. No dimensions were attempted."
 
     Dim i As Long, comp As SldWorks.Component2
     Debug.Print LOG_PREFIX & " view: " & targetView.GetName2
@@ -85,15 +71,11 @@ Public Sub main()
     Next i
     doc.ClearSelection2 True
     doc.GraphicsRedraw2
-    If created = 0 And Not blocked Then
-        result = props.Delete2(marker)
-        If HasProperty(props, marker) Then Debug.Print LOG_PREFIX & ": could not remove empty-run marker"
-    End If
     RestorePreference
-    If blocked Then MsgBox LOG_PREFIX & ": STOP - dimension creation or cleanup has an uncertain outcome. Inspect this drawing manually. Run marker retained.", vbCritical
+    If blocked Then MsgBox LOG_PREFIX & ": STOP - dimension creation or cleanup has an uncertain outcome. Inspect this drawing manually before rerunning.", vbCritical
     Debug.Print LOG_PREFIX & " END created=" & created & "; skipped=" & skipped & "; failed=" & failed & "; blocked=" & blocked
     MsgBox LOG_PREFIX & ": created=" & created & "; skipped=" & skipped & "; failed=" & failed & vbCrLf & _
-        "Details: VBA Immediate window (Ctrl+G). Review dimensions and custom properties before saving.", vbInformation
+        "Details: VBA Immediate window (Ctrl+G). Review dimensions before saving.", vbInformation
     Exit Sub
 Fatal:
     Dim message As String
@@ -125,19 +107,6 @@ Private Sub ClearSelectionSafely()
 ClearFailed:
     Debug.Print LOG_PREFIX & ": could not clear selection: " & Err.Description
 End Sub
-
-Private Function HasProperty(ByVal props As SldWorks.CustomPropertyManager, ByVal name As String) As Boolean
-    Dim names As Variant, i As Long
-    names = props.GetNames
-    If IsEmpty(names) Then Exit Function
-    If Not IsArray(names) Then Exit Function
-    For i = LBound(names) To UBound(names)
-        If StrComp(CStr(names(i)), name, vbTextCompare) = 0 Then
-            HasProperty = True
-            Exit Function
-        End If
-    Next i
-End Function
 
 Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     On Error GoTo FailedComponent
