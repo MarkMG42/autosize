@@ -3,9 +3,11 @@ Option Explicit
 
 ' Requires SolidWorks type libraries (normal SolidWorks VBA macro project).
 ' Distances and coordinates are in metres. No document is saved automatically.
-Private Const MACRO_VERSION As String = "2.0.0"
+Private Const MACRO_VERSION As String = "2.1"
 Private Const LOG_PREFIX As String = "AutoFrameDim v" & MACRO_VERSION
-Private Const OFFSET_M As Double = 0.008
+Private Const OFFSET_M As Double = 0.010
+Private Const OUTLINE_TOL_M As Double = 0.001
+Private Const COORD_EQUAL_TOL_M As Double = 0.0001
 Private Const MIN_LENGTH_M As Double = 0.02
 Private Const MIN_PROJECTED_M As Double = 0.001
 Private Const LENGTH_TOL_M As Double = 0.000001
@@ -17,6 +19,8 @@ Private targetView As SldWorks.View
 Private created As Long, skipped As Long, failed As Long
 Private blocked As Boolean
 Private preferenceCaptured As Boolean, oldInputPreference As Boolean
+Private viewOutline As Variant
+Private coordinateRejectLogCount As Long
 
 Public Sub main()
     On Error GoTo Fatal
@@ -37,6 +41,16 @@ Public Sub main()
     Set targetView = sm.GetSelectedObject6(1, -1)
     If targetView Is Nothing Then Err.Raise vbObjectError + 5, , "Cannot obtain selected view."
     If CBool(targetView.ProjectedDimensions) Then Err.Raise vbObjectError + 6, , "Set this view's dimension type to True before running. Projected dimensions are not supported."
+
+    viewOutline = targetView.GetOutline
+    If Not IsArray(viewOutline) Then Err.Raise vbObjectError + 19, , "View outline unavailable."
+    If UBound(viewOutline) - LBound(viewOutline) <> 3 Then Err.Raise vbObjectError + 19, , "Invalid view outline."
+    If viewOutline(2) <= viewOutline(0) Or viewOutline(3) <= viewOutline(1) Then _
+        Err.Raise vbObjectError + 19, , "Empty view outline."
+    Dim viewPosition As Variant
+    viewPosition = targetView.Position
+    Debug.Print LOG_PREFIX & " outline mm: " & SheetPoint(viewOutline(0), viewOutline(1)) & " to " & SheetPoint(viewOutline(2), viewOutline(3))
+    Debug.Print LOG_PREFIX & " view position mm: " & SheetPoint(viewPosition(0), viewPosition(1)) & "; scale=" & targetView.ScaleDecimal & "; offset mm=" & OFFSET_M * 1000#
 
     Dim comps As Variant
     comps = targetView.GetVisibleComponents
@@ -127,6 +141,7 @@ End Function
 
 Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     On Error GoTo FailedComponent
+    coordinateRejectLogCount = 0
     Dim edges As Variant
     edges = targetView.GetVisibleEntities2(comp, swViewEntityType_Edge)
     If IsEmpty(edges) Then
@@ -147,7 +162,7 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     For i = LBound(edges) To UBound(edges)
         If TypeOf edges(i) Is SldWorks.Edge Then
         Set edge = edges(i)
-        If Candidate(edge, length, x, y, reason) Then
+        If Candidate(edge, comp, length, x, y, reason) Then
             Set body = edge.GetBody
             If Not body Is Nothing Then
                 index = 0
@@ -191,7 +206,7 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     Next key
     For i = 1 To bestEdges.Count
         Set edge = bestEdges(i)
-        AddEdgeDimension edge, comp.Name2
+        AddEdgeDimension edge, comp
         If blocked Then Exit For
     Next i
     Exit Sub
@@ -200,8 +215,8 @@ FailedComponent:
     Debug.Print LOG_PREFIX & " " & comp.Name2 & ": component failed: " & Err.Description
 End Sub
 
-Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, _
-        ByRef labelX As Double, ByRef labelY As Double, ByRef reason As String) As Boolean
+Private Function Candidate(ByVal edge As SldWorks.Edge, ByVal comp As SldWorks.Component2, ByRef length As Double, _
+        ByRef labelX As Double, ByRef labelY As Double, ByRef reason As String, Optional ByVal reportCoordinates As Boolean = False) As Boolean
     On Error GoTo Unusable
     reason = "edge unavailable"
     If edge Is Nothing Then Exit Function
@@ -228,15 +243,32 @@ Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, 
     reason = "shorter than MIN_LENGTH_M"
     If length < MIN_LENGTH_M Then Exit Function
 
-    ' Edges are obtained from the drawing view's component context.
-    ' Do not apply Transform2 again: this can double-transform assembly entities.
-    Dim mu As SldWorks.MathUtility, pa As SldWorks.MathPoint, pb As SldWorks.MathPoint
-    reason = "view transform"
-    Set mu = swApp.GetMathUtility
-    Set pa = mu.CreatePoint(a): Set pb = mu.CreatePoint(b)
-    Set pa = pa.MultiplyTransform(targetView.ModelToViewTransform)
-    Set pb = pb.MultiplyTransform(targetView.ModelToViewTransform)
-    a = pa.ArrayData: b = pb.ArrayData
+    ' Determine a plausible coordinate path without silently assuming edge context.
+    ' GetOutline is only a guard, NOT proof that points belong to this edge.
+    Dim directA As Variant, directB As Variant, componentA As Variant, componentB As Variant
+    Dim directOK As Boolean, componentOK As Boolean, path As String
+    reason = "view coordinate projection"
+    directOK = ProjectEndpoints(a, b, comp, False, directA, directB)
+    componentOK = ProjectEndpoints(a, b, comp, True, componentA, componentB)
+    Dim directInside As Boolean, componentInside As Boolean
+    If directOK Then directInside = PointsInsideOutline(directA, directB)
+    If componentOK Then componentInside = PointsInsideOutline(componentA, componentB)
+    If directInside And componentInside Then
+        If Not SameSheetPoints(directA, directB, componentA, componentB) Then
+            reason = "ambiguous component coordinate context"
+            LogRejectedCoordinates comp, reason, directOK, directA, directB, componentOK, componentA, componentB
+            Exit Function
+        End If
+        a = directA: b = directB: path = "direct (paths agree)"
+    ElseIf directInside Then
+        a = directA: b = directB: path = "direct"
+    ElseIf componentInside Then
+        a = componentA: b = componentB: path = "Component.Transform2 then view"
+    Else
+        reason = "neither coordinate path fits view outline"
+        LogRejectedCoordinates comp, reason, directOK, directA, directB, componentOK, componentA, componentB
+        Exit Function
+    End If
     Dim dx As Double, dy As Double, projected As Double
     dx = b(0) - a(0): dy = b(1) - a(1)
     projected = Sqr(dx * dx + dy * dy)
@@ -248,6 +280,11 @@ Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, 
     End If
     labelX = (a(0) + b(0)) / 2 - dy / projected * OFFSET_M
     labelY = (a(1) + b(1)) / 2 + dx / projected * OFFSET_M
+    If reportCoordinates Then
+        Debug.Print LOG_PREFIX & " " & comp.Name2 & " coordinate path: " & path
+        Debug.Print LOG_PREFIX & " sheet mm A=" & SheetPoint(a(0), a(1)) & "; B=" & SheetPoint(b(0), b(1))
+        Debug.Print LOG_PREFIX & " midpoint mm=" & SheetPoint((a(0) + b(0)) / 2, (a(1) + b(1)) / 2) & "; requested label mm=" & SheetPoint(labelX, labelY)
+    End If
     Candidate = True
     reason = ""
     Exit Function
@@ -255,10 +292,65 @@ Unusable:
     reason = reason & ": VBA error " & CStr(Err.Number) & " - " & Err.Description
 End Function
 
-Private Sub AddEdgeDimension(ByVal edge As SldWorks.Edge, ByVal componentName As String)
+Private Function ProjectEndpoints(ByVal a As Variant, ByVal b As Variant, ByVal comp As SldWorks.Component2, _
+        ByVal applyComponent As Boolean, ByRef outA As Variant, ByRef outB As Variant) As Boolean
+    On Error GoTo ProjectionFailed
+    Dim mu As SldWorks.MathUtility, pa As SldWorks.MathPoint, pb As SldWorks.MathPoint
+    Dim transform As SldWorks.MathTransform
+    Set mu = swApp.GetMathUtility
+    If mu Is Nothing Then Exit Function
+    Set pa = mu.CreatePoint(a): Set pb = mu.CreatePoint(b)
+    If pa Is Nothing Then Exit Function
+    If pb Is Nothing Then Exit Function
+    If applyComponent Then
+        Set transform = comp.Transform2
+        If transform Is Nothing Then Exit Function
+        Set pa = pa.MultiplyTransform(transform)
+        Set pb = pb.MultiplyTransform(transform)
+    End If
+    Set transform = targetView.ModelToViewTransform
+    If transform Is Nothing Then Exit Function
+    Set pa = pa.MultiplyTransform(transform)
+    Set pb = pb.MultiplyTransform(transform)
+    outA = pa.ArrayData: outB = pb.ArrayData
+    ProjectEndpoints = True
+    Exit Function
+ProjectionFailed:
+    ProjectEndpoints = False
+End Function
+
+Private Function PointsInsideOutline(ByVal a As Variant, ByVal b As Variant) As Boolean
+    PointsInsideOutline = (a(0) >= viewOutline(0) - OUTLINE_TOL_M And a(0) <= viewOutline(2) + OUTLINE_TOL_M And _
+        a(1) >= viewOutline(1) - OUTLINE_TOL_M And a(1) <= viewOutline(3) + OUTLINE_TOL_M And _
+        b(0) >= viewOutline(0) - OUTLINE_TOL_M And b(0) <= viewOutline(2) + OUTLINE_TOL_M And _
+        b(1) >= viewOutline(1) - OUTLINE_TOL_M And b(1) <= viewOutline(3) + OUTLINE_TOL_M)
+End Function
+
+Private Function SameSheetPoints(ByVal a As Variant, ByVal b As Variant, ByVal c As Variant, ByVal d As Variant) As Boolean
+    SameSheetPoints = (Abs(a(0) - c(0)) <= COORD_EQUAL_TOL_M And Abs(a(1) - c(1)) <= COORD_EQUAL_TOL_M And _
+        Abs(b(0) - d(0)) <= COORD_EQUAL_TOL_M And Abs(b(1) - d(1)) <= COORD_EQUAL_TOL_M)
+End Function
+
+Private Function SheetPoint(ByVal x As Double, ByVal y As Double) As String
+    SheetPoint = "(" & Format$(x * 1000#, "0.###") & ", " & Format$(y * 1000#, "0.###") & ")"
+End Function
+
+Private Sub LogRejectedCoordinates(ByVal comp As SldWorks.Component2, ByVal reason As String, _
+        ByVal directOK As Boolean, ByVal a As Variant, ByVal b As Variant, _
+        ByVal componentOK As Boolean, ByVal c As Variant, ByVal d As Variant)
+    ' Limit detailed samples; summary counters still include every rejected edge.
+    If coordinateRejectLogCount >= 5 Then Exit Sub
+    coordinateRejectLogCount = coordinateRejectLogCount + 1
+    Debug.Print LOG_PREFIX & " " & comp.Name2 & ": " & reason
+    If directOK Then Debug.Print LOG_PREFIX & " direct sheet mm A=" & SheetPoint(a(0), a(1)) & "; B=" & SheetPoint(b(0), b(1))
+    If componentOK Then Debug.Print LOG_PREFIX & " component sheet mm A=" & SheetPoint(c(0), c(1)) & "; B=" & SheetPoint(d(0), d(1))
+End Sub
+
+Private Sub AddEdgeDimension(ByVal edge As SldWorks.Edge, ByVal comp As SldWorks.Component2)
     On Error GoTo FailedDimension
-    Dim length As Double, x As Double, y As Double, reason As String
-    If Not Candidate(edge, length, x, y, reason) Then Err.Raise vbObjectError + 12, , "Candidate became unavailable: " & reason
+    Dim length As Double, x As Double, y As Double, reason As String, componentName As String
+    componentName = comp.Name2
+    If Not Candidate(edge, comp, length, x, y, reason, True) Then Err.Raise vbObjectError + 12, , "Candidate became unavailable: " & reason
     doc.ClearSelection2 True
     If CBool(targetView.SelectEntity(edge, False)) = False Then Err.Raise vbObjectError + 13, , "Cannot select edge in view"
     Dim dd As SldWorks.DisplayDimension, creationAttempted As Boolean
