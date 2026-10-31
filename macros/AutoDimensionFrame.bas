@@ -189,8 +189,13 @@ Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, 
     reason = "curve unavailable"
     Set curve = edge.GetCurve
     If curve Is Nothing Then Exit Function
-    reason = "not straight"
-    If Not curve.IsLine Then Exit Function
+    Dim lineResult As Variant
+    reason = "IsLine call"
+    lineResult = curve.IsLine
+    If CBool(lineResult) = False Then
+        reason = "not straight (IsLine=" & CStr(lineResult) & ", type=" & TypeName(lineResult) & ")"
+        Exit Function
+    End If
     reason = "vertex unavailable"
     Dim va As SldWorks.Vertex, vb As SldWorks.Vertex
     Set va = edge.GetStartVertex: Set vb = edge.GetEndVertex
