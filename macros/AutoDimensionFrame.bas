@@ -3,6 +3,8 @@ Option Explicit
 
 ' Requires SolidWorks type libraries (normal SolidWorks VBA macro project).
 ' Distances and coordinates are in metres. No document is saved automatically.
+Private Const MACRO_VERSION As String = "2.0.0"
+Private Const LOG_PREFIX As String = "AutoFrameDim v" & MACRO_VERSION
 Private Const OFFSET_M As Double = 0.008
 Private Const MIN_LENGTH_M As Double = 0.02
 Private Const MIN_PROJECTED_M As Double = 0.001
@@ -19,6 +21,10 @@ Private preferenceCaptured As Boolean, oldInputPreference As Boolean
 Public Sub main()
     On Error GoTo Fatal
     preferenceCaptured = False
+    created = 0: skipped = 0: failed = 0: blocked = False
+    Set doc = Nothing
+    Set targetView = Nothing
+    Debug.Print LOG_PREFIX & " START " & CStr(Now)
     Set swApp = Application.SldWorks
     Set doc = swApp.ActiveDoc
     If doc Is Nothing Then Err.Raise vbObjectError + 1, , "Open a drawing first."
@@ -30,7 +36,7 @@ Public Sub main()
     If sm.GetSelectedObjectType3(1, -1) <> swSelDRAWINGVIEWS Then Err.Raise vbObjectError + 4, , "Select the view border, not an edge."
     Set targetView = sm.GetSelectedObject6(1, -1)
     If targetView Is Nothing Then Err.Raise vbObjectError + 5, , "Cannot obtain selected view."
-    If targetView.ProjectedDimensions Then Err.Raise vbObjectError + 6, , "Set this view's dimension type to True before running. Projected dimensions are not supported."
+    If CBool(targetView.ProjectedDimensions) Then Err.Raise vbObjectError + 6, , "Set this view's dimension type to True before running. Projected dimensions are not supported."
 
     Dim comps As Variant
     comps = targetView.GetVisibleComponents
@@ -45,10 +51,10 @@ Public Sub main()
     marker = MARKER_PREFIX & sheet.GetName & ":" & targetView.GetName2
     If HasProperty(props, marker) Then Err.Raise vbObjectError + 9, , "This view already has an AutoFrameDim run marker. See README before repeating."
 
-    oldInputPreference = swApp.GetUserPreferenceToggle(swInputDimValOnCreate)
+    oldInputPreference = CBool(swApp.GetUserPreferenceToggle(swInputDimValOnCreate))
     preferenceCaptured = True
     swApp.SetUserPreferenceToggle swInputDimValOnCreate, False
-    If swApp.GetUserPreferenceToggle(swInputDimValOnCreate) Then _
+    If CBool(swApp.GetUserPreferenceToggle(swInputDimValOnCreate)) Then _
         Err.Raise vbObjectError + 17, , "Cannot disable dimension value input preference."
 
     ' Persist a guard BEFORE annotation mutation; interrupted runs cannot duplicate.
@@ -56,9 +62,8 @@ Public Sub main()
     result = props.Add3(marker, swCustomInfoText, "Started " & CStr(Now), swCustomPropertyOnlyIfNew)
     If Not HasProperty(props, marker) Then Err.Raise vbObjectError + 10, , "Cannot create repeat-run guard. No dimensions were attempted."
 
-    created = 0: skipped = 0: failed = 0: blocked = False
     Dim i As Long, comp As SldWorks.Component2
-    Debug.Print "AutoFrameDim view: " & targetView.GetName2
+    Debug.Print LOG_PREFIX & " view: " & targetView.GetName2
     For i = LBound(comps) To UBound(comps)
         Set comp = comps(i)
         If Not comp Is Nothing Then ProcessComponent comp
@@ -66,31 +71,45 @@ Public Sub main()
     Next i
     doc.ClearSelection2 True
     doc.GraphicsRedraw2
-    If created = 0 And Not blocked Then props.Delete2 marker
+    If created = 0 And Not blocked Then
+        result = props.Delete2(marker)
+        If HasProperty(props, marker) Then Debug.Print LOG_PREFIX & ": could not remove empty-run marker"
+    End If
     RestorePreference
-    If blocked Then MsgBox "STOP: a newly created invalid dimension could not be removed. Inspect this drawing manually.", vbCritical
-    MsgBox "AutoFrameDim: created=" & created & "; skipped=" & skipped & "; failed=" & failed & vbCrLf & _
+    If blocked Then MsgBox LOG_PREFIX & ": STOP - dimension creation or cleanup has an uncertain outcome. Inspect this drawing manually. Run marker retained.", vbCritical
+    Debug.Print LOG_PREFIX & " END created=" & created & "; skipped=" & skipped & "; failed=" & failed & "; blocked=" & blocked
+    MsgBox LOG_PREFIX & ": created=" & created & "; skipped=" & skipped & "; failed=" & failed & vbCrLf & _
         "Details: VBA Immediate window (Ctrl+G). Review dimensions and custom properties before saving.", vbInformation
     Exit Sub
 Fatal:
     Dim message As String
     message = Err.Description
     RestorePreference
-    If Not doc Is Nothing Then doc.ClearSelection2 True
-    MsgBox "AutoFrameDim stopped: " & message, vbExclamation
+    ClearSelectionSafely
+    Debug.Print LOG_PREFIX & " STOP: " & message
+    MsgBox LOG_PREFIX & " stopped: " & message, vbExclamation
 End Sub
 
 Private Sub RestorePreference()
     On Error GoTo RestoreFailed
     If preferenceCaptured Then
         swApp.SetUserPreferenceToggle swInputDimValOnCreate, oldInputPreference
-        If swApp.GetUserPreferenceToggle(swInputDimValOnCreate) <> oldInputPreference Then _
+        If CBool(swApp.GetUserPreferenceToggle(swInputDimValOnCreate)) <> oldInputPreference Then _
             Err.Raise vbObjectError + 18, , "Preference restore failed"
         preferenceCaptured = False
     End If
     Exit Sub
 RestoreFailed:
-    MsgBox "Could not restore Input dimension value preference. Check SolidWorks options.", vbExclamation
+    Debug.Print LOG_PREFIX & ": preference restore failed: " & Err.Description
+    MsgBox LOG_PREFIX & ": Could not restore Input dimension value preference. Check SolidWorks options.", vbExclamation
+End Sub
+
+Private Sub ClearSelectionSafely()
+    On Error GoTo ClearFailed
+    If Not doc Is Nothing Then doc.ClearSelection2 True
+    Exit Sub
+ClearFailed:
+    Debug.Print LOG_PREFIX & ": could not clear selection: " & Err.Description
 End Sub
 
 Private Function HasProperty(ByVal props As SldWorks.CustomPropertyManager, ByVal name As String) As Boolean
@@ -112,7 +131,7 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     edges = targetView.GetVisibleEntities2(comp, swViewEntityType_Edge)
     If IsEmpty(edges) Then
         skipped = skipped + 1
-        Debug.Print comp.Name2 & ": no visible edges"
+        Debug.Print LOG_PREFIX & " " & comp.Name2 & ": no visible edges"
         Exit Sub
     End If
     If Not IsArray(edges) Then Err.Raise vbObjectError + 11, , "Visible edges unavailable"
@@ -164,11 +183,12 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     Next i
     If bestEdges.Count = 0 Then
         skipped = skipped + 1
-        Debug.Print comp.Name2 & ": no usable visible straight edge; edge count=" & (UBound(edges) - LBound(edges) + 1)
-        For Each key In stats.Keys
-            Debug.Print "  " & CStr(key) & ": " & stats(key)
-        Next key
+        Debug.Print LOG_PREFIX & " " & comp.Name2 & ": no usable visible straight edge; edge count=" & (UBound(edges) - LBound(edges) + 1)
     End If
+    Debug.Print LOG_PREFIX & " " & comp.Name2 & ": candidates=" & bestEdges.Count & "; visible edges=" & (UBound(edges) - LBound(edges) + 1)
+    For Each key In stats.Keys
+        Debug.Print LOG_PREFIX & "  rejected " & CStr(key) & ": " & stats(key)
+    Next key
     For i = 1 To bestEdges.Count
         Set edge = bestEdges(i)
         AddEdgeDimension edge, comp.Name2
@@ -177,7 +197,7 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     Exit Sub
 FailedComponent:
     failed = failed + 1
-    Debug.Print comp.Name2 & ": component failed: " & Err.Description
+    Debug.Print LOG_PREFIX & " " & comp.Name2 & ": component failed: " & Err.Description
 End Sub
 
 Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, _
@@ -238,10 +258,11 @@ End Function
 Private Sub AddEdgeDimension(ByVal edge As SldWorks.Edge, ByVal componentName As String)
     On Error GoTo FailedDimension
     Dim length As Double, x As Double, y As Double, reason As String
-    If Not Candidate(edge, length, x, y, reason) Then Err.Raise vbObjectError + 12, , "Candidate became unavailable"
+    If Not Candidate(edge, length, x, y, reason) Then Err.Raise vbObjectError + 12, , "Candidate became unavailable: " & reason
     doc.ClearSelection2 True
-    If Not targetView.SelectEntity(edge, False) Then Err.Raise vbObjectError + 13, , "Cannot select edge in view"
-    Dim dd As SldWorks.DisplayDimension
+    If CBool(targetView.SelectEntity(edge, False)) = False Then Err.Raise vbObjectError + 13, , "Cannot select edge in view"
+    Dim dd As SldWorks.DisplayDimension, creationAttempted As Boolean
+    creationAttempted = True
     Set dd = doc.AddDimension2(x, y, 0#)
     If dd Is Nothing Then Err.Raise vbObjectError + 14, , "AddDimension2 returned Nothing"
     Dim dimValue As SldWorks.Dimension
@@ -251,20 +272,23 @@ Private Sub AddEdgeDimension(ByVal edge As SldWorks.Edge, ByVal componentName As
     actual = dimValue.SystemValue
     If Abs(actual - length) > LENGTH_TOL_M Then Err.Raise vbObjectError + 16, , "Dimension is not the true edge length"
     doc.ClearSelection2 True
-    Debug.Print componentName & ": created, length=" & Format$(actual * 1000#, "0.###") & " mm"
+    Debug.Print LOG_PREFIX & " " & componentName & ": created, length=" & Format$(actual * 1000#, "0.###") & " mm"
     created = created + 1
     Exit Sub
 FailedDimension:
     reason = Err.Description
     failed = failed + 1
-    Debug.Print componentName & ": failed: " & reason
+    Debug.Print LOG_PREFIX & " " & componentName & ": failed: " & reason
     If Not dd Is Nothing Then
         If Not RemoveNewDimension(dd) Then
             blocked = True
-            Debug.Print "STOP: failed to remove the newly created invalid dimension. Inspect manually."
+            Debug.Print LOG_PREFIX & ": STOP: failed to remove the new dimension. Inspect manually."
         End If
+    ElseIf creationAttempted Then
+        blocked = True
+        Debug.Print LOG_PREFIX & ": STOP: AddDimension2 was attempted but no dimension handle is available. Inspect manually."
     End If
-    doc.ClearSelection2 True
+    ClearSelectionSafely
 End Sub
 
 Private Function RemoveNewDimension(ByVal dd As SldWorks.DisplayDimension) As Boolean
@@ -273,7 +297,7 @@ Private Function RemoveNewDimension(ByVal dd As SldWorks.DisplayDimension) As Bo
     Set ann = dd.GetAnnotation
     If ann Is Nothing Then Exit Function
     doc.ClearSelection2 True
-    If Not ann.Select3(False, Nothing) Then Exit Function
-    RemoveNewDimension = doc.Extension.DeleteSelection2(0)
+    If CBool(ann.Select3(False, Nothing)) = False Then Exit Function
+    RemoveNewDimension = CBool(doc.Extension.DeleteSelection2(0))
 CannotRemove:
 End Function
