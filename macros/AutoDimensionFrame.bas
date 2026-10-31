@@ -250,7 +250,6 @@ Private Sub AddEdgeDimension(ByVal edge As SldWorks.Edge, ByVal componentName As
     created = created + 1
     Exit Sub
 FailedDimension:
-    Dim reason As String
     reason = Err.Description
     failed = failed + 1
     Debug.Print componentName & ": failed: " & reason
