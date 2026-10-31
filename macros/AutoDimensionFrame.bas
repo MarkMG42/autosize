@@ -47,7 +47,8 @@ Public Sub main()
 
     oldInputPreference = swApp.GetUserPreferenceToggle(swInputDimValOnCreate)
     preferenceCaptured = True
-    If Not swApp.SetUserPreferenceToggle(swInputDimValOnCreate, False) Then _
+    swApp.SetUserPreferenceToggle swInputDimValOnCreate, False
+    If swApp.GetUserPreferenceToggle(swInputDimValOnCreate) Then _
         Err.Raise vbObjectError + 17, , "Cannot disable dimension value input preference."
 
     ' Persist a guard BEFORE annotation mutation; interrupted runs cannot duplicate.
@@ -82,7 +83,8 @@ End Sub
 Private Sub RestorePreference()
     On Error GoTo RestoreFailed
     If preferenceCaptured Then
-        If Not swApp.SetUserPreferenceToggle(swInputDimValOnCreate, oldInputPreference) Then _
+        swApp.SetUserPreferenceToggle swInputDimValOnCreate, oldInputPreference
+        If swApp.GetUserPreferenceToggle(swInputDimValOnCreate) <> oldInputPreference Then _
             Err.Raise vbObjectError + 18, , "Preference restore failed"
         preferenceCaptured = False
     End If
