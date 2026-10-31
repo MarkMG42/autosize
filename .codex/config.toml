@@ -1,0 +1,16 @@
+# Координатор + до трёх специализированных подагентов.
+[agents]
+max_concurrent_threads_per_session = 4
+max_depth = 1
+
+[agents.coder]
+description = "Пишет и оптимизирует код в назначенных файлах"
+config_file = "../engineering-knowledge/agents/coder.toml"
+
+[agents.api_expert]
+description = "Проверяет SolidWorks API, VBA/COM и сигнатуры, только чтение"
+config_file = "../engineering-knowledge/agents/api_expert.toml"
+
+[agents.debugger]
+description = "Диагностирует ошибки и проверяет регрессии, только чтение"
+config_file = "../engineering-knowledge/agents/debugger.toml"
