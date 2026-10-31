@@ -122,11 +122,13 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
     Dim lengths As New Collection
     Dim i As Long, j As Long, index As Long
     Dim edge As SldWorks.Edge, body As SldWorks.Body2, oldBody As SldWorks.Body2
-    Dim length As Double, x As Double, y As Double
+    Dim length As Double, x As Double, y As Double, reason As String
+    Dim stats As Object, key As Variant
+    Set stats = CreateObject("Scripting.Dictionary")
     For i = LBound(edges) To UBound(edges)
         If TypeOf edges(i) Is SldWorks.Edge Then
         Set edge = edges(i)
-        If Candidate(edge, length, x, y) Then
+        If Candidate(edge, length, x, y, reason) Then
             Set body = edge.GetBody
             If Not body Is Nothing Then
                 index = 0
@@ -147,13 +149,25 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
                     lengths.Add length, Before:=index
                     lengths.Remove index + 1
                 End If
+            Else
+                reason = "body unavailable"
             End If
         End If
+        Else
+            reason = "not an Edge"
         End If
+        If Len(reason) > 0 Then
+            If Not stats.Exists(reason) Then stats.Add reason, 0
+            stats(reason) = CLng(stats(reason)) + 1
+        End If
+        reason = ""
     Next i
     If bestEdges.Count = 0 Then
         skipped = skipped + 1
-        Debug.Print comp.Name2 & ": no usable visible straight edge"
+        Debug.Print comp.Name2 & ": no usable visible straight edge; edge count=" & (UBound(edges) - LBound(edges) + 1)
+        For Each key In stats.Keys
+            Debug.Print "  " & CStr(key) & ": " & stats(key)
+        Next key
     End If
     For i = 1 To bestEdges.Count
         Set edge = bestEdges(i)
@@ -167,25 +181,32 @@ FailedComponent:
 End Sub
 
 Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, _
-        ByRef labelX As Double, ByRef labelY As Double) As Boolean
+        ByRef labelX As Double, ByRef labelY As Double, ByRef reason As String) As Boolean
     On Error GoTo Unusable
+    reason = "edge unavailable"
     If edge Is Nothing Then Exit Function
     Dim curve As SldWorks.Curve
+    reason = "curve unavailable"
     Set curve = edge.GetCurve
     If curve Is Nothing Then Exit Function
+    reason = "not straight"
     If Not curve.IsLine Then Exit Function
+    reason = "vertex unavailable"
     Dim va As SldWorks.Vertex, vb As SldWorks.Vertex
     Set va = edge.GetStartVertex: Set vb = edge.GetEndVertex
     If va Is Nothing Then Exit Function
     If vb Is Nothing Then Exit Function
     Dim a As Variant, b As Variant
+    reason = "vertex coordinates"
     a = va.GetPoint: b = vb.GetPoint
     length = Sqr((b(0) - a(0)) ^ 2 + (b(1) - a(1)) ^ 2 + (b(2) - a(2)) ^ 2)
+    reason = "shorter than MIN_LENGTH_M"
     If length < MIN_LENGTH_M Then Exit Function
 
     ' Edges are obtained from the drawing view's component context.
     ' Do not apply Transform2 again: this can double-transform assembly entities.
     Dim mu As SldWorks.MathUtility, pa As SldWorks.MathPoint, pb As SldWorks.MathPoint
+    reason = "view transform"
     Set mu = swApp.GetMathUtility
     Set pa = mu.CreatePoint(a): Set pb = mu.CreatePoint(b)
     Set pa = pa.MultiplyTransform(targetView.ModelToViewTransform)
@@ -194,6 +215,7 @@ Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, 
     Dim dx As Double, dy As Double, projected As Double
     dx = b(0) - a(0): dy = b(1) - a(1)
     projected = Sqr(dx * dx + dy * dy)
+    reason = "projection shorter than MIN_PROJECTED_M"
     If projected < MIN_PROJECTED_M Then Exit Function
     ' Stable normal independent of the edge's vertex ordering.
     If dx < 0 Or (Abs(dx) < 0.000000001 And dy < 0) Then
@@ -202,13 +224,16 @@ Private Function Candidate(ByVal edge As SldWorks.Edge, ByRef length As Double, 
     labelX = (a(0) + b(0)) / 2 - dy / projected * OFFSET_M
     labelY = (a(1) + b(1)) / 2 + dx / projected * OFFSET_M
     Candidate = True
+    reason = ""
+    Exit Function
 Unusable:
+    reason = reason & ": VBA error " & CStr(Err.Number) & " - " & Err.Description
 End Function
 
 Private Sub AddEdgeDimension(ByVal edge As SldWorks.Edge, ByVal componentName As String)
     On Error GoTo FailedDimension
-    Dim length As Double, x As Double, y As Double
-    If Not Candidate(edge, length, x, y) Then Err.Raise vbObjectError + 12, , "Candidate became unavailable"
+    Dim length As Double, x As Double, y As Double, reason As String
+    If Not Candidate(edge, length, x, y, reason) Then Err.Raise vbObjectError + 12, , "Candidate became unavailable"
     doc.ClearSelection2 True
     If Not targetView.SelectEntity(edge, False) Then Err.Raise vbObjectError + 13, , "Cannot select edge in view"
     Dim dd As SldWorks.DisplayDimension
