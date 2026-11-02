@@ -3,7 +3,7 @@ Option Explicit
 
 ' Read-only geometry/cut-list probe. No dimensions, rebuilds, configuration
 ' switches, cut-list updates, selection changes or document saves.
-Private Const PREFIX As String = "FrameCutListProbe v1.0"
+Private Const PREFIX As String = "FrameCutListProbe v1.1"
 Private app As SldWorks.SldWorks
 Private drawing As SldWorks.ModelDoc2
 Private view As SldWorks.View
@@ -16,26 +16,14 @@ Private outputPath As String
 
 Public Sub main()
     On Error GoTo Failed
-    Set output = Nothing
-    Set frameInstance = Nothing
-    Set visited = New Collection
-    folders = 0: bodiesReported = 0: errors = 0
-    outputPath = ""
-    OpenLog
-    LogLine PREFIX & " START " & CStr(Now)
-    Set app = Application.SldWorks
+    BeginProbe
+    LogLine "MODE=drawing edge"
     Set drawing = app.ActiveDoc
     If drawing Is Nothing Then Err.Raise vbObjectError + 1, , "Open the assembly drawing."
     If drawing.GetType <> swDocDRAWING Then Err.Raise vbObjectError + 2, , "Active document must be a drawing."
     Dim sm As SldWorks.SelectionMgr, selectedEdge As SldWorks.Edge
     Set sm = drawing.SelectionManager
-    If sm.GetSelectedObjectCount2(-1) <> 1 Then _
-        Err.Raise vbObjectError + 3, , "Select ONE visible edge of the multibody FRAME part in the drawing view."
-    If sm.GetSelectedObjectType3(1, -1) <> swSelEDGES Then _
-        Err.Raise vbObjectError + 4, , "Select an edge of the FRAME part, not the view border or an accessory."
-    Set selectedEdge = sm.GetSelectedObject6(1, -1)
-    Set view = sm.GetSelectedObjectsDrawingView2(1, -1)
-    If view Is Nothing Then Err.Raise vbObjectError + 5, , "Selected edge has no drawing view."
+    Set selectedEdge = ReadSelectedFrameEdge(sm, view)
     Dim reference As SldWorks.ModelDoc2
     Set reference = view.ReferencedDocument
     If reference Is Nothing Then Err.Raise vbObjectError + 6, , "Resolve/open the referenced model first."
@@ -59,32 +47,115 @@ Public Sub main()
         Err.Raise vbObjectError + 10, , "Only assembly and part references supported."
     End If
     If frameModel.GetType <> swDocPART Then Err.Raise vbObjectError + 11, , "Selected component must be the multibody FRAME PART."
+    ReportFrameCutList
+    DescribeEdge selectedEdge, "SELECTED VIEW EDGE"
+    DescribeSourceEdge selectedEdge
+    FinishProbe
+    Exit Sub
+Failed:
+    StopProbe Err.Number, Err.Description
+End Sub
+
+Public Sub ProbeActiveFramePart()
+    On Error GoTo Failed
+    BeginProbe
+    LogLine "MODE=active part only; drawing edge/context test NOT performed"
+    Set frameModel = app.ActiveDoc
+    If frameModel Is Nothing Then Err.Raise vbObjectError + 20, , "Open the multibody FRAME PART first."
+    If frameModel.GetType <> swDocPART Then _
+        Err.Raise vbObjectError + 21, , "Active document must be the FRAME PART, not the assembly or drawing."
+    CheckConfiguration frameModel, ""
+    ReportFrameCutList
+    FinishProbe
+    Exit Sub
+Failed:
+    StopProbe Err.Number, Err.Description
+End Sub
+
+Private Sub BeginProbe()
+    CloseLog
+    Set output = Nothing
+    Set drawing = Nothing
+    Set view = Nothing
+    Set frameModel = Nothing
+    Set frameInstance = Nothing
+    Set visited = New Collection
+    folders = 0: bodiesReported = 0: errors = 0
+    outputPath = ""
+    OpenLog
+    LogLine "START " & CStr(Now)
+    Set app = Application.SldWorks
+End Sub
+
+Private Function ReadSelectedFrameEdge(ByVal sm As SldWorks.SelectionMgr, _
+        ByRef selectedView As SldWorks.View) As SldWorks.Edge
+    Dim count As Long, edges As Long, i As Long, selectionType As Long
+    Dim item As Object, candidate As SldWorks.Edge, itemView As SldWorks.View
+    count = sm.GetSelectedObjectCount2(-1)
+    LogLine "SELECTION total=" & count
+    If count = 0 Then Err.Raise vbObjectError + 3, , _
+        "Selection is empty at macro start. Click a frame edge, then run via Tools > Macro > Run. " & _
+        "Alternatively open the frame PART and run ProbeActiveFramePart."
+    For i = 1 To count
+        selectionType = sm.GetSelectedObjectType3(i, -1)
+        Set item = sm.GetSelectedObject6(i, -1)
+        Set itemView = sm.GetSelectedObjectsDrawingView2(i, -1)
+        If i <= 30 Then
+            LogLine "SELECTION index=" & i & "; API type=" & selectionType & "; object=" & TypeName(item)
+            If itemView Is Nothing Then
+                LogLine "  drawing view=Nothing"
+            Else
+                LogLine "  drawing view=[" & itemView.GetName2 & "]"
+            End If
+        End If
+        If selectionType = swSelEDGES Then
+            edges = edges + 1
+            If edges = 1 Then
+                If Not item Is Nothing Then
+                    If TypeOf item Is SldWorks.Edge Then Set candidate = item
+                End If
+                Set selectedView = itemView
+            End If
+        End If
+    Next i
+    LogLine "SELECTION edge count=" & edges & "; other selections=" & (count - edges)
+    If edges <> 1 Then Err.Raise vbObjectError + 3, , _
+        "Expected ONE edge; found edges=" & edges & "; total selections=" & count & _
+        ". Press Esc in the drawing, click one frame edge, then run the macro."
+    If candidate Is Nothing Then Err.Raise vbObjectError + 4, , "Selected edge object unavailable or not SldWorks.Edge."
+    If selectedView Is Nothing Then Err.Raise vbObjectError + 5, , "Selected edge has no drawing view."
+    Set ReadSelectedFrameEdge = candidate
+End Function
+
+Private Sub ReportFrameCutList()
+    If frameModel Is Nothing Then Err.Raise vbObjectError + 22, , "Frame model has not been set."
+    If frameModel.GetType <> swDocPART Then Err.Raise vbObjectError + 23, , "Frame model must be a PART."
     LogLine "FRAME MODEL=[" & frameModel.GetTitle & "]; path=[" & frameModel.GetPathName & "]"
     Dim framePart As SldWorks.PartDoc, solids As Variant, solidCount As Long
     Set framePart = frameModel
     solids = framePart.GetBodies2(swSolidBody, False)
     If HasItems(solids) Then solidCount = UBound(solids) - LBound(solids) + 1
     LogLine "FRAME solid bodies=" & solidCount
-    LogLine "ONLY this selected part is inspected. Property values below have NO assumed units."
-    DescribeEdge selectedEdge, "SELECTED VIEW EDGE"
-    DescribeSourceEdge selectedEdge
+    LogLine "ONLY this part is inspected. Property values below have NO assumed units."
     Dim feature As SldWorks.Feature
     Set feature = frameModel.FirstFeature
     Do While Not feature Is Nothing
         VisitFeature feature
         Set feature = feature.GetNextFeature
     Loop
+End Sub
+
+Private Sub FinishProbe()
     LogLine "END folders=" & folders & "; body entries=" & bodiesReported & "; errors=" & errors
     CloseLog
     MsgBox PREFIX & ": folders=" & folders & "; body entries=" & bodiesReported & "; errors=" & errors & vbCrLf & _
         "No dimensions created. No model saved or rebuilt." & vbCrLf & "Log: " & outputPath, vbInformation
-    Exit Sub
-Failed:
-    Dim message As String
-    message = CStr(Err.Number) & ": " & Err.Description
-    LogLine "STOP " & message
+End Sub
+
+Private Sub StopProbe(ByVal number As Long, ByVal description As String)
+    LogLine "STOP " & CStr(number) & ": " & description
     CloseLog
-    MsgBox PREFIX & " stopped: " & message & vbCrLf & "Log: " & outputPath, vbExclamation
+    MsgBox PREFIX & " stopped: " & description & vbCrLf & "Log: " & outputPath, vbExclamation
 End Sub
 
 Private Sub OpenLog()
