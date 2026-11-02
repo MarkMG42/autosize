@@ -4,7 +4,7 @@ Option Explicit
 ' Creates ONE true dimension for the ONE selected full-length frame edge.
 ' Standalone module: standard SldWorks and SwConst references only.
 ' No bulk processing, numeric text overrides, model rebuilds or document saves.
-Private Const PREFIX As String = "FrameCutListDimensionTrial v1.1"
+Private Const PREFIX As String = "FrameCutListDimensionTrial v1.2"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -127,10 +127,8 @@ Public Sub main()
     End If
     halfWidth = EstimateHalfWidth(expectedLength, height)
     If Not FindPosition(halfWidth, height, x, y) Then Err.Raise vbObjectError + 50, , "No near-edge text slot for actual font height."
-    If ApiBoolean(ann.SetPosition2(x, y, 0#)) = False Then Err.Raise vbObjectError + 51, , "Cannot position new dimension."
     Dim p As Variant
-    p = ann.GetPosition
-    If Not HasItems(p) Then Err.Raise vbObjectError + 52, , "New annotation position readback unavailable."
+    p = MoveAnnotationToTarget(ann, x, y)
     LogLine "TEXT requested m=(" & x & ", " & y & "); actual m=(" & p(0) & ", " & p(1) & ")"
     If Abs(p(0) - x) > POSITION_TOL_M Or Abs(p(1) - y) > POSITION_TOL_M Then _
         Err.Raise vbObjectError + 53, , "SolidWorks did not retain requested annotation position."
@@ -165,6 +163,56 @@ Failed:
     LogLine "END stopped; preference restored=" & restored
     CloseLog
     MsgBox PREFIX & " stopped: " & message & vbCrLf & "Inspect the log/drawing before rerunning." & vbCrLf & "Log: " & outputPath, vbExclamation
+End Sub
+
+Private Function MoveAnnotationToTarget(ByVal ann As SldWorks.Annotation, _
+        ByVal targetX As Double, ByVal targetY As Double) As Variant
+    ' Bounded native experiment: preserve the annotation's original Z and
+    ' compensate an observed offset. The target and tolerance never change.
+    Dim before As Variant, actual As Variant
+    before = ann.GetPosition
+    RequirePosition before
+    Dim requestX As Double, requestY As Double, preservedZ As Double
+    Dim errorX As Double, errorY As Double, distance As Double, previousDistance As Double
+    Dim previousX As Double, previousY As Double, attempt As Long, accepted As Boolean
+    requestX = targetX: requestY = targetY: preservedZ = CDbl(before(2))
+    LogLine "TEXT initial XYZ m=(" & before(0) & ", " & before(1) & ", " & before(2) & ")"
+    LogLine "TEXT fixed target XY m=(" & targetX & ", " & targetY & "); command Z preserved=" & preservedZ
+    For attempt = 1 To 3
+        accepted = ApiBoolean(ann.SetPosition2(requestX, requestY, preservedZ))
+        LogLine "TEXT move=" & attempt & "; command XYZ m=(" & requestX & ", " & requestY & ", " & preservedZ & "); API accepted=" & accepted
+        If accepted = False Then Err.Raise vbObjectError + 51, , "Cannot position new dimension."
+        drawing.GraphicsRedraw2
+        actual = ann.GetPosition
+        RequirePosition actual
+        errorX = CDbl(actual(0)) - targetX: errorY = CDbl(actual(1)) - targetY
+        distance = Sqr(errorX * errorX + errorY * errorY)
+        LogLine "TEXT move=" & attempt & "; actual XYZ m=(" & actual(0) & ", " & actual(1) & ", " & actual(2) & _
+            "); XY error m=(" & errorX & ", " & errorY & "); error norm m=" & distance
+        If Abs(errorX) <= POSITION_TOL_M And Abs(errorY) <= POSITION_TOL_M Then
+            MoveAnnotationToTarget = actual
+            Exit Function
+        End If
+        If attempt > 1 Then
+            If Abs(CDbl(actual(0)) - previousX) <= POSITION_TOL_M And _
+                Abs(CDbl(actual(1)) - previousY) <= POSITION_TOL_M Then _
+                Err.Raise vbObjectError + 80, , "Annotation position is constrained: different commands gave the same actual XY."
+            If distance >= previousDistance - POSITION_TOL_M * 0.1 Then _
+                Err.Raise vbObjectError + 81, , "Annotation correction did not reduce error; coordinate/plane mapping needs inspection."
+        End If
+        If attempt < 3 Then
+            previousDistance = distance
+            previousX = CDbl(actual(0)): previousY = CDbl(actual(1))
+            requestX = requestX - errorX: requestY = requestY - errorY
+        End If
+    Next attempt
+    Err.Raise vbObjectError + 82, , "Annotation did not reach the fixed target after three moves; no relaxed position accepted."
+End Function
+
+Private Sub RequirePosition(ByVal coordinates As Variant)
+    If HasItems(coordinates) = False Then Err.Raise vbObjectError + 52, , "Annotation XYZ position unavailable."
+    If LBound(coordinates) <> 0 Or UBound(coordinates) <> 2 Then _
+        Err.Raise vbObjectError + 52, , "Expected annotation position array with three XYZ coordinates."
 End Sub
 
 Private Function ApiBoolean(ByVal raw As Variant) As Boolean
