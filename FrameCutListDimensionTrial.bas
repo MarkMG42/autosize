@@ -4,7 +4,7 @@ Option Explicit
 ' Creates ONE true dimension for the ONE selected full-length frame edge.
 ' Standalone module: standard SldWorks and SwConst references only.
 ' No bulk processing, numeric text overrides, model rebuilds or document saves.
-Private Const PREFIX As String = "FrameCutListDimensionTrial v1.0"
+Private Const PREFIX As String = "FrameCutListDimensionTrial v1.1"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -44,7 +44,7 @@ Public Sub main()
     Dim sm As SldWorks.SelectionMgr, selectedEdge As SldWorks.Edge
     Set sm = drawing.SelectionManager
     Set selectedEdge = ReadSelectedFrameEdge(sm, view)
-    If CBool(view.ProjectedDimensions) Then Err.Raise vbObjectError + 30, , _
+    If ApiBoolean(view.ProjectedDimensions) Then Err.Raise vbObjectError + 30, , _
         "Set this view's dimension type to True (not Projected), then rerun. View mode was not changed."
     ResolveContext selectedEdge
     Dim converted As Object, sourceEdge As SldWorks.Edge
@@ -55,8 +55,17 @@ Public Sub main()
     Dim curve As SldWorks.Curve, va As SldWorks.Vertex, vb As SldWorks.Vertex
     Set curve = sourceEdge.GetCurve
     If curve Is Nothing Then Err.Raise vbObjectError + 33, , "Source curve unavailable."
-    LogLine "SOURCE EDGE curve Identity=" & curve.Identity & "; IsLine=" & CBool(curve.IsLine)
-    If Not CBool(curve.IsLine) Then Err.Raise vbObjectError + 34, , "Selected source edge is not straight."
+    Dim rawLine As Variant, isLineCached As Boolean, curveIdentity As Long
+    ' Some COM Boolean values can carry noncanonical True bits. Read ONCE;
+    ' log the raw numeric representation and compare with False, never Not.
+    rawLine = curve.IsLine
+    curveIdentity = curve.Identity
+    LogLine "SOURCE EDGE raw IsLine=" & CStr(rawLine) & "; TypeName=" & TypeName(rawLine) & _
+        "; VarType=" & VarType(rawLine) & "; numeric=" & CLng(rawLine)
+    isLineCached = ApiBoolean(rawLine)
+    LogLine "SOURCE EDGE curve Identity=" & curveIdentity & "; IsLine cached=" & isLineCached & _
+        "; canonical numeric=" & CLng(isLineCached)
+    If isLineCached = False Then Err.Raise vbObjectError + 34, , "Selected source edge is not straight (cached result)."
     Set va = sourceEdge.GetStartVertex: Set vb = sourceEdge.GetEndVertex
     If va Is Nothing Or vb Is Nothing Then Err.Raise vbObjectError + 35, , "Source edge vertices unavailable."
     Dim a As Variant, b As Variant, edgeLength As Double
@@ -91,14 +100,14 @@ Public Sub main()
     Dim x As Double, y As Double, height As Double, halfWidth As Double
     height = 0.004: halfWidth = EstimateHalfWidth(expectedLength, height)
     If Not FindPosition(halfWidth, height, x, y) Then Err.Raise vbObjectError + 43, , "No free near-edge text slot inside sheet margins."
-    oldInputPreference = CBool(app.GetUserPreferenceToggle(swInputDimValOnCreate))
+    oldInputPreference = ApiBoolean(app.GetUserPreferenceToggle(swInputDimValOnCreate))
     preferenceCaptured = True
     app.SetUserPreferenceToggle swInputDimValOnCreate, False
-    If CBool(app.GetUserPreferenceToggle(swInputDimValOnCreate)) Then _
+    If ApiBoolean(app.GetUserPreferenceToggle(swInputDimValOnCreate)) Then _
         Err.Raise vbObjectError + 44, , "Cannot disable dimension value input."
     selectionTouched = True
     drawing.ClearSelection2 True
-    If Not CBool(view.SelectEntity(selectedEdge, False)) Then Err.Raise vbObjectError + 45, , "Cannot select original edge in its drawing view."
+    If ApiBoolean(view.SelectEntity(selectedEdge, False)) = False Then Err.Raise vbObjectError + 45, , "Cannot select original edge in its drawing view."
     VerifySingleSelection sm
     attempted = True
     Set dd = drawing.AddDimension2(x, y, 0#)
@@ -118,7 +127,7 @@ Public Sub main()
     End If
     halfWidth = EstimateHalfWidth(expectedLength, height)
     If Not FindPosition(halfWidth, height, x, y) Then Err.Raise vbObjectError + 50, , "No near-edge text slot for actual font height."
-    If Not CBool(ann.SetPosition2(x, y, 0#)) Then Err.Raise vbObjectError + 51, , "Cannot position new dimension."
+    If ApiBoolean(ann.SetPosition2(x, y, 0#)) = False Then Err.Raise vbObjectError + 51, , "Cannot position new dimension."
     Dim p As Variant
     p = ann.GetPosition
     If Not HasItems(p) Then Err.Raise vbObjectError + 52, , "New annotation position readback unavailable."
@@ -157,6 +166,12 @@ Failed:
     CloseLog
     MsgBox PREFIX & " stopped: " & message & vbCrLf & "Inspect the log/drawing before rerunning." & vbCrLf & "Log: " & outputPath, vbExclamation
 End Sub
+
+Private Function ApiBoolean(ByVal raw As Variant) As Boolean
+    ' A comparison produces a canonical VBA Boolean for either COM True
+    ' representation (1 or -1), rather than applying bitwise Not to raw bits.
+    ApiBoolean = (CBool(raw) <> False)
+End Function
 
 Private Sub ResolveContext(ByVal selectedEdge As SldWorks.Edge)
     Dim reference As SldWorks.ModelDoc2
@@ -240,8 +255,8 @@ Private Sub ReadCutListLength(ByVal feature As SldWorks.Feature)
         If StrComp(PropertyToken(raw), "LENGTH", vbTextCompare) = 0 Then
             LogLine "LENGTH property=[" & CStr(names(i)) & "]; raw=[" & raw & "]; resolved=[" & resolved & _
                 "]; status=" & status & "; wasResolved=" & wasResolved & "; linked=" & linked
-            If Not wasResolved Then Err.Raise vbObjectError + 59, , "Cut-list LENGTH is not resolved in the cached properties."
-            If Not linked Then Err.Raise vbObjectError + 79, , "Cut-list LENGTH property is not linked."
+            If ApiBoolean(wasResolved) = False Then Err.Raise vbObjectError + 59, , "Cut-list LENGTH is not resolved in the cached properties."
+            If ApiBoolean(linked) = False Then Err.Raise vbObjectError + 79, , "Cut-list LENGTH property is not linked."
             matches = matches + 1
             expectedLength = ParsePlainPositiveNumber(resolved) * CUTLIST_MM_TO_M
         End If
@@ -373,7 +388,7 @@ Private Function RestorePreference() As Boolean
     On Error GoTo RestoreFailed
     If preferenceCaptured Then
         app.SetUserPreferenceToggle swInputDimValOnCreate, oldInputPreference
-        If CBool(app.GetUserPreferenceToggle(swInputDimValOnCreate)) <> oldInputPreference Then _
+        If ApiBoolean(app.GetUserPreferenceToggle(swInputDimValOnCreate)) <> oldInputPreference Then _
             Err.Raise vbObjectError + 71, , "Input dimension preference restore failed."
         preferenceCaptured = False
         LogLine "SETTING Input dimension value restored=" & oldInputPreference
@@ -390,9 +405,9 @@ Private Function RemoveNewDimension(ByVal dd As SldWorks.DisplayDimension) As Bo
     Set ann = dd.GetAnnotation
     If ann Is Nothing Then Exit Function
     drawing.ClearSelection2 True
-    If Not CBool(ann.Select3(False, Nothing)) Then Exit Function
+    If ApiBoolean(ann.Select3(False, Nothing)) = False Then Exit Function
     If drawing.SelectionManager.GetSelectedObjectCount2(-1) <> 1 Then Exit Function
-    RemoveNewDimension = CBool(drawing.Extension.DeleteSelection2(0))
+    RemoveNewDimension = ApiBoolean(drawing.Extension.DeleteSelection2(0))
     Exit Function
 CannotRemove:
     LogLine "CLEANUP ERROR: " & Err.Number & ": " & Err.Description
