@@ -4,7 +4,7 @@ Option Explicit
 ' Creates ONE true dimension for the ONE selected full-length frame edge.
 ' Standalone module: standard SldWorks and SwConst references only.
 ' No bulk processing, numeric text overrides, model rebuilds or document saves.
-Private Const PREFIX As String = "FrameCutListDimensionTrial v1.2"
+Private Const PREFIX As String = "FrameCutListDimensionTrial v1.3"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -168,13 +168,15 @@ End Sub
 Private Function MoveAnnotationToTarget(ByVal ann As SldWorks.Annotation, _
         ByVal targetX As Double, ByVal targetY As Double) As Variant
     ' Bounded native experiment: preserve the annotation's original Z and
-    ' compensate an observed offset. The target and tolerance never change.
+    ' learn a measured one-direction response. Target/tolerance never change.
     Dim before As Variant, actual As Variant
     before = ann.GetPosition
     RequirePosition before
     Dim requestX As Double, requestY As Double, preservedZ As Double
     Dim errorX As Double, errorY As Double, distance As Double, previousDistance As Double
     Dim previousX As Double, previousY As Double, attempt As Long, accepted As Boolean
+    Dim previousRequestX As Double, previousRequestY As Double
+    Dim responseGain As Double, correctionX As Double, correctionY As Double
     requestX = targetX: requestY = targetY: preservedZ = CDbl(before(2))
     LogLine "TEXT initial XYZ m=(" & before(0) & ", " & before(1) & ", " & before(2) & ")"
     LogLine "TEXT fixed target XY m=(" & targetX & ", " & targetY & "); command Z preserved=" & preservedZ
@@ -201,12 +203,50 @@ Private Function MoveAnnotationToTarget(ByVal ann As SldWorks.Annotation, _
                 Err.Raise vbObjectError + 81, , "Annotation correction did not reduce error; coordinate/plane mapping needs inspection."
         End If
         If attempt < 3 Then
+            responseGain = 1#
+            correctionX = errorX: correctionY = errorY
+            If attempt > 1 Then responseGain = MeasuredResponseGain(requestX - previousRequestX, _
+                requestY - previousRequestY, CDbl(actual(0)) - previousX, CDbl(actual(1)) - previousY, _
+                errorX, errorY, correctionX, correctionY)
+            If Sqr(correctionX * correctionX + correctionY * correctionY) > 0.05 Then _
+                Err.Raise vbObjectError + 83, , "Position command correction exceeds the 50 mm local trial limit."
+            LogLine "TEXT measured response gain=" & responseGain & "; next command correction XY m=(" & correctionX & ", " & correctionY & ")"
             previousDistance = distance
             previousX = CDbl(actual(0)): previousY = CDbl(actual(1))
-            requestX = requestX - errorX: requestY = requestY - errorY
+            previousRequestX = requestX: previousRequestY = requestY
+            requestX = requestX - correctionX: requestY = requestY - correctionY
         End If
     Next attempt
     Err.Raise vbObjectError + 82, , "Annotation did not reach the fixed target after three moves; no relaxed position accepted."
+End Function
+
+Private Function MeasuredResponseGain(ByVal commandX As Double, ByVal commandY As Double, _
+        ByVal actualX As Double, ByVal actualY As Double, ByVal errorX As Double, ByVal errorY As Double, _
+        ByRef correctionX As Double, ByRef correctionY As Double) As Double
+    ' Use the native response to the previous command step, not an assumed
+    ' sheet/annotation scale. A single sampled direction cannot identify a
+    ' general XY transform: reject cross-coupling or a target off that direction.
+    Dim commandSquared As Double, gain As Double, errorAlong As Double
+    Dim responseResidualX As Double, responseResidualY As Double
+    Dim targetResidualX As Double, targetResidualY As Double
+    commandSquared = commandX * commandX + commandY * commandY
+    If commandSquared < 0.000000000001 Then Err.Raise vbObjectError + 84, , "Insufficient command step for response calibration."
+    gain = (actualX * commandX + actualY * commandY) / commandSquared
+    If gain <= 0.0001 Or gain > 10000# Then _
+        Err.Raise vbObjectError + 85, , "Position response is nonpositive or poorly conditioned."
+    responseResidualX = actualX - gain * commandX: responseResidualY = actualY - gain * commandY
+    errorAlong = (errorX * commandX + errorY * commandY) / commandSquared
+    targetResidualX = errorX - errorAlong * commandX: targetResidualY = errorY - errorAlong * commandY
+    LogLine "TEXT calibration gain=" & gain & "; response residual XY m=(" & responseResidualX & ", " & responseResidualY & _
+        "); target residual XY m=(" & targetResidualX & ", " & targetResidualY & ")"
+    If Sqr(responseResidualX * responseResidualX + responseResidualY * responseResidualY) > POSITION_TOL_M * 0.1 Then _
+        Err.Raise vbObjectError + 86, , "Position response has XY cross-coupling; one-direction correction is unsafe."
+    If Sqr(targetResidualX * targetResidualX + targetResidualY * targetResidualY) > POSITION_TOL_M * 0.1 Then _
+        Err.Raise vbObjectError + 87, , "Target error is outside the calibrated direction."
+    ' Only correct the measured direction. A tiny perpendicular residual is
+    ' already within tolerance; do not amplify it using an unmeasured gain.
+    correctionX = errorAlong * commandX / gain: correctionY = errorAlong * commandY / gain
+    MeasuredResponseGain = gain
 End Function
 
 Private Sub RequirePosition(ByVal coordinates As Variant)
