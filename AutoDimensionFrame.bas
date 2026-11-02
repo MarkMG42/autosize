@@ -3,7 +3,7 @@ Option Explicit
 
 ' Requires SolidWorks type libraries (normal SolidWorks VBA macro project).
 ' Distances and coordinates are in metres. No document is saved automatically.
-Private Const MACRO_VERSION As String = "2.4.1"
+Private Const MACRO_VERSION As String = "2.4.2"
 Private Const LOG_PREFIX As String = "AutoFrameDim v" & MACRO_VERSION
 Private Const OFFSET_M As Double = 0.004
 Private Const OUTLINE_TOL_M As Double = 0.001
@@ -21,7 +21,14 @@ Private viewOutline As Variant
 Private assemblyView As Boolean
 Private sheetWidth As Double, sheetHeight As Double
 Private occupied As Collection
-Private localEdges As Collection, instanceEdges As Collection
+Private localEdges As Collection, instanceEdges As Collection, assemblyEdges As Collection
+Private viewModel As SldWorks.ModelDoc2, sourceModel As SldWorks.ModelDoc2
+Private sourceInstance As SldWorks.Component2
+Private modelComponents As Variant
+Private reverseMatches As Long, forwardMatches As Long, missingMatches As Long
+Private correspondenceErrors As Long, forwardBuilt As Boolean
+Private reverseErrors As Long, assemblyErrors As Long, viewErrors As Long
+Private reverseNulls As Long, reverseWrongTypes As Long, reverseNonLocal As Long
 Private bodiesSeen As Long, unresolved As Long
 Private Const TEXT_HEIGHT_M As Double = 0.004
 Private Const LAYOUT_GAP_M As Double = 0.001
@@ -35,6 +42,10 @@ Public Sub main()
     Set occupied = New Collection
     Set doc = Nothing
     Set targetView = Nothing
+    Set viewModel = Nothing
+    Set sourceModel = Nothing
+    Set sourceInstance = Nothing
+    modelComponents = Empty
     Debug.Print LOG_PREFIX & " START " & CStr(Now)
     Set swApp = Application.SldWorks
     Set doc = swApp.ActiveDoc
@@ -57,6 +68,7 @@ Public Sub main()
     Dim referenced As SldWorks.ModelDoc2
     Set referenced = targetView.ReferencedDocument
     If referenced Is Nothing Then Err.Raise vbObjectError + 7, , "Referenced model unavailable. Open/resolve the model first."
+    Set viewModel = referenced
     assemblyView = (referenced.GetType = swDocASSEMBLY)
     If Not assemblyView And referenced.GetType <> swDocPART Then _
         Err.Raise vbObjectError + 8, , "Only part and assembly views are supported."
@@ -67,8 +79,12 @@ Public Sub main()
     If sheetWidth <= 0 Or sheetHeight <= 0 Then Err.Raise vbObjectError + 9, , "Invalid sheet size."
     Debug.Print LOG_PREFIX & ": existing dimensions preserved; rerun can create duplicates"
     SeedOccupied
-    If Not assemblyView Then
-        CheckSourceConfiguration referenced, targetView.ReferencedConfiguration, "part view"
+    CheckSourceConfiguration referenced, targetView.ReferencedConfiguration, "view model"
+    If assemblyView Then
+        Dim assembly As SldWorks.AssemblyDoc
+        Set assembly = referenced
+        modelComponents = assembly.GetComponents(False)
+        If Not HasItems(modelComponents) Then Err.Raise vbObjectError + 33, , "Referenced assembly has no accessible model components"
     End If
     Dim comps As Variant
     comps = targetView.GetVisibleComponents
@@ -173,21 +189,70 @@ Private Sub CheckSourceConfiguration(ByVal model As SldWorks.ModelDoc2, _
     End If
 End Sub
 
-' Normalize to a source PART edge before any math. Never infer coordinate
-' context from a bounding rectangle. Keep the visible edge for selection.
+Private Function ResolveModelComponent(ByVal drawingComponent As SldWorks.Component2) As SldWorks.Component2
+    ' Drawing components are not assumed to be assembly-document components.
+    ' First use the target document's corresponding-object conversion; validate
+    ' its identity against the actual assembly tree before accepting it.
+    Dim normalized As Object, candidate As SldWorks.Component2, found As SldWorks.Component2
+    Dim i As Long, matches As Long, requestedPath As String
+    Set normalized = TryCorrespondingObject(viewModel, drawingComponent)
+    If Not normalized Is Nothing Then
+        For i = LBound(modelComponents) To UBound(modelComponents)
+            Set candidate = modelComponents(i)
+            If swApp.IsSame(normalized, candidate) = swObjectSame Then
+                Set ResolveModelComponent = candidate
+                Exit Function
+            End If
+        Next i
+    End If
+    ' A unique FULL hierarchical name is acceptable; basename-only matching is not.
+    requestedPath = drawingComponent.GetPathName
+    For i = LBound(modelComponents) To UBound(modelComponents)
+        Set candidate = modelComponents(i)
+        If StrComp(candidate.Name2, drawingComponent.Name2, vbTextCompare) = 0 Then
+            If Len(requestedPath) = 0 Or StrComp(candidate.GetPathName, requestedPath, vbTextCompare) = 0 Then
+                matches = matches + 1
+                Set found = candidate
+            End If
+        End If
+    Next i
+    If matches <> 1 Then Err.Raise vbObjectError + 34, , _
+        "Cannot uniquely resolve drawing component in assembly tree: " & drawingComponent.Name2 & "; matches=" & matches
+    Set ResolveModelComponent = found
+End Function
+
+Private Function TryCorrespondingObject(ByVal model As SldWorks.ModelDoc2, ByVal item As Object) As Object
+    On Error GoTo NoCorrespondence
+    Set TryCorrespondingObject = model.Extension.GetCorresponding2(item)
+    Exit Function
+NoCorrespondence:
+    Debug.Print LOG_PREFIX & ": model corresponding-object API error " & Err.Number & ": " & Err.Description
+End Function
+
 Private Sub BuildLocalLookup(ByVal comp As SldWorks.Component2)
     Set localEdges = New Collection
     Set instanceEdges = New Collection
-    If Not assemblyView Then Exit Sub
-    If comp Is Nothing Then Err.Raise vbObjectError + 20, , "Missing component instance"
-    Dim model As SldWorks.ModelDoc2, part As SldWorks.PartDoc
-    Set model = comp.GetModelDoc2
-    If model Is Nothing Then Err.Raise vbObjectError + 21, , "Component model unavailable; resolve lightweight/suppressed components first"
-    If model.GetType <> swDocPART Then Err.Raise vbObjectError + 22, , "Expected a leaf part component"
-    CheckSourceConfiguration model, comp.ReferencedConfiguration, ComponentName(comp)
-    Set part = model
+    Set assemblyEdges = New Collection
+    Set sourceInstance = Nothing
+    reverseMatches = 0: forwardMatches = 0: missingMatches = 0
+    correspondenceErrors = 0: forwardBuilt = False
+    reverseErrors = 0: assemblyErrors = 0: viewErrors = 0
+    reverseNulls = 0: reverseWrongTypes = 0: reverseNonLocal = 0
+    If assemblyView Then
+        If comp Is Nothing Then Err.Raise vbObjectError + 20, , "Missing drawing component"
+        Set sourceInstance = ResolveModelComponent(comp)
+        Set sourceModel = sourceInstance.GetModelDoc2
+        If sourceModel Is Nothing Then Err.Raise vbObjectError + 21, , "Resolve the component model first"
+        Debug.Print LOG_PREFIX & " model instance=" & sourceInstance.Name2 & "; config=[" & sourceInstance.ReferencedConfiguration & "]"
+        CheckSourceConfiguration sourceModel, sourceInstance.ReferencedConfiguration, sourceInstance.Name2
+    Else
+        Set sourceModel = viewModel
+    End If
+    If sourceModel.GetType <> swDocPART Then Err.Raise vbObjectError + 22, , "Expected a leaf part model"
+    Dim part As SldWorks.PartDoc
+    Set part = sourceModel
     Dim bs As Variant, es As Variant, i As Long, j As Long
-    Dim body As SldWorks.Body2, edge As SldWorks.Edge, mapped As Object
+    Dim body As SldWorks.Body2, edge As SldWorks.Edge
     bs = part.GetBodies2(swAllBodies, False)
     If Not HasItems(bs) Then Err.Raise vbObjectError + 23, , "Source part has no accessible bodies"
     For i = LBound(bs) To UBound(bs)
@@ -196,35 +261,134 @@ Private Sub BuildLocalLookup(ByVal comp As SldWorks.Component2)
         If HasItems(es) Then
             For j = LBound(es) To UBound(es)
                 Set edge = es(j)
-                Set mapped = comp.GetCorresponding(edge)
                 localEdges.Add edge
-                ' Collection permits Nothing objects; retain the parallel index.
-                instanceEdges.Add mapped
             Next j
         End If
     Next i
+    Debug.Print LOG_PREFIX & ": source edges=" & localEdges.Count
 End Sub
 
-Private Function SourceEdge(ByVal visibleEdge As SldWorks.Edge) As SldWorks.Edge
-    If Not assemblyView Then
-        Set SourceEdge = visibleEdge
-        Exit Function
-    End If
-    Dim i As Long, localEdge As SldWorks.Edge, mapped As Object
+Private Function LocalMember(ByVal item As Object) As SldWorks.Edge
+    If item Is Nothing Then Exit Function
+    If Not TypeOf item Is SldWorks.Edge Then Exit Function
+    Dim edge As SldWorks.Edge, i As Long
     For i = 1 To localEdges.Count
-        Set localEdge = localEdges(i)
-        If swApp.IsSame(visibleEdge, localEdge) = swObjectSame Then
-            Set SourceEdge = localEdge
+        Set edge = localEdges(i)
+        If swApp.IsSame(item, edge) = swObjectSame Then
+            Set LocalMember = edge
             Exit Function
         End If
+    Next i
+End Function
+
+Private Function ReverseCorrespondence(ByVal visibleEdge As SldWorks.Edge) As Object
+    On Error GoTo ConversionFailed
+    ' The receiver is the TARGET source document. Do not compare the converted
+    ' source entity's identity directly with the drawing-context entity.
+    Set ReverseCorrespondence = sourceModel.Extension.GetCorrespondingEntity2(visibleEdge)
+    Exit Function
+ConversionFailed:
+    correspondenceErrors = correspondenceErrors + 1
+    reverseErrors = reverseErrors + 1
+    If reverseErrors = 1 Then Debug.Print LOG_PREFIX & ": source entity conversion error " & Err.Number & ": " & Err.Description
+End Function
+
+Private Sub BuildForwardLookup()
+    ' Exact fallback: local -> actual assembly instance -> selected drawing view.
+    Dim edge As SldWorks.Edge, inAssembly As Object, inView As Object, i As Long
+    Dim assemblyCount As Long, viewCount As Long
+    For i = 1 To localEdges.Count
+        Set edge = localEdges(i)
+        Set inAssembly = ForwardAssemblyEntity(edge)
+        Set inView = Nothing
+        If Not inAssembly Is Nothing Then
+            assemblyCount = assemblyCount + 1
+            Set inView = ForwardViewEntity(inAssembly)
+        End If
+        If Not inView Is Nothing Then viewCount = viewCount + 1
+        assemblyEdges.Add inAssembly
+        instanceEdges.Add inView
+    Next i
+    forwardBuilt = True
+    Debug.Print LOG_PREFIX & ": forward lookup: source=" & localEdges.Count & _
+        "; assembly/model=" & assemblyCount & "; drawing view=" & viewCount
+End Sub
+
+Private Function ForwardAssemblyEntity(ByVal edge As SldWorks.Edge) As Object
+    On Error GoTo ConversionFailed
+    If assemblyView Then
+        Set ForwardAssemblyEntity = sourceInstance.GetCorresponding(edge)
+    Else
+        Set ForwardAssemblyEntity = edge
+    End If
+    Exit Function
+ConversionFailed:
+    correspondenceErrors = correspondenceErrors + 1
+    assemblyErrors = assemblyErrors + 1
+    If assemblyErrors = 1 Then Debug.Print LOG_PREFIX & ": assembly entity conversion error " & Err.Number & ": " & Err.Description
+End Function
+
+Private Function ForwardViewEntity(ByVal item As Object) As Object
+    On Error GoTo ConversionFailed
+    Set ForwardViewEntity = targetView.GetCorresponding(item)
+    Exit Function
+ConversionFailed:
+    correspondenceErrors = correspondenceErrors + 1
+    viewErrors = viewErrors + 1
+    If viewErrors = 1 Then Debug.Print LOG_PREFIX & ": view entity conversion error " & Err.Number & ": " & Err.Description
+End Function
+
+Private Function SourceEdge(ByVal visibleEdge As SldWorks.Edge) As SldWorks.Edge
+    Dim localEdge As SldWorks.Edge, converted As Object
+    Set converted = ReverseCorrespondence(visibleEdge)
+    If converted Is Nothing Then
+        reverseNulls = reverseNulls + 1
+    ElseIf Not TypeOf converted Is SldWorks.Edge Then
+        reverseWrongTypes = reverseWrongTypes + 1
+        If reverseWrongTypes = 1 Then Debug.Print LOG_PREFIX & ": reverse conversion unexpected type=" & TypeName(converted)
+    Else
+        Set localEdge = LocalMember(converted)
+        If localEdge Is Nothing Then
+            reverseNonLocal = reverseNonLocal + 1
+            If reverseNonLocal = 1 Then Debug.Print LOG_PREFIX & ": reverse edge is not in active source-part geometry"
+        End If
+    End If
+    If localEdge Is Nothing Then Set localEdge = LocalMember(visibleEdge)
+    If Not localEdge Is Nothing Then
+        reverseMatches = reverseMatches + 1
+        Set SourceEdge = localEdge
+        Exit Function
+    End If
+    If Not forwardBuilt Then BuildForwardLookup
+    Dim i As Long, mapped As Object
+    For i = 1 To localEdges.Count
         Set mapped = instanceEdges(i)
         If Not mapped Is Nothing Then
             If swApp.IsSame(visibleEdge, mapped) = swObjectSame Then
-                Set SourceEdge = localEdge
+                forwardMatches = forwardMatches + 1
+                Set SourceEdge = localEdges(i)
+                Exit Function
+            End If
+        End If
+        Set mapped = assemblyEdges(i)
+        If Not mapped Is Nothing Then
+            If swApp.IsSame(visibleEdge, mapped) = swObjectSame Then
+                forwardMatches = forwardMatches + 1
+                Set SourceEdge = localEdges(i)
                 Exit Function
             End If
         End If
     Next i
+    missingMatches = missingMatches + 1
+End Function
+
+Private Function IsStraightEdge(ByVal edge As SldWorks.Edge) As Boolean
+    ' Propagate unexpected API errors to the component handler. A curved edge
+    ' is not a missing straight-length candidate and must not block its body.
+    Dim curve As SldWorks.Curve
+    Set curve = edge.GetCurve
+    If curve Is Nothing Then Err.Raise vbObjectError + 35, , "Visible edge curve unavailable"
+    IsStraightEdge = CBool(curve.IsLine)
 End Function
 
 Private Function StraightLength(ByVal edge As SldWorks.Edge, ByRef length As Double, _
@@ -291,31 +455,39 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
                     completeMaps.Add True
                     index = bodies.Count
                 End If
-                Set localEdge = SourceEdge(edge)
-                If localEdge Is Nothing Then
-                    completeMaps.Add False, Before:=index
-                    completeMaps.Remove index + 1
-                    Debug.Print LOG_PREFIX & " " & componentLabel & " body=" & index & _
-                        " edge=" & i & ": SOURCE MAPPING FAILED (assembly feature or unsupported context)"
-                ElseIf StraightLength(localEdge, length, reason) Then
-                    Set candidates = edgeLists(index)
-                    If length > CDbl(maxLengths(index)) + LENGTH_TOL_M Then
-                        ' Keep only alternatives of the SAME maximum length.
-                        Do While candidates.Count > 0
-                            candidates.Remove candidates.Count
-                        Loop
-                        maxLengths.Add length, Before:=index
-                        maxLengths.Remove index + 1
+                If IsStraightEdge(edge) Then
+                    Set localEdge = SourceEdge(edge)
+                    If localEdge Is Nothing Then
+                        completeMaps.Add False, Before:=index
+                        completeMaps.Remove index + 1
+                        Debug.Print LOG_PREFIX & " " & componentLabel & " body=" & index & _
+                            " edge=" & i & ": SOURCE MAPPING FAILED after source/view context conversion"
+                    ElseIf StraightLength(localEdge, length, reason) Then
+                        Set candidates = edgeLists(index)
+                        If length > CDbl(maxLengths(index)) + LENGTH_TOL_M Then
+                            ' Keep only alternatives of the SAME maximum length.
+                            Do While candidates.Count > 0
+                                candidates.Remove candidates.Count
+                            Loop
+                            maxLengths.Add length, Before:=index
+                            maxLengths.Remove index + 1
+                        End If
+                        If Abs(length - CDbl(maxLengths(index))) <= LENGTH_TOL_M Then candidates.Add edge
+                    Else
+                        completeMaps.Add False, Before:=index
+                        completeMaps.Remove index + 1
+                        Debug.Print LOG_PREFIX & " " & componentLabel & " edge=" & i & " unusable straight geometry: " & reason
                     End If
-                    If Abs(length - CDbl(maxLengths(index))) <= LENGTH_TOL_M Then candidates.Add edge
-                Else
-                    Debug.Print LOG_PREFIX & " " & componentLabel & " edge=" & i & " excluded: " & reason
                 End If
             Else
                 Debug.Print LOG_PREFIX & " " & componentLabel & " edge=" & i & ": body unavailable"
             End If
         End If
     Next i
+    Debug.Print LOG_PREFIX & " " & componentLabel & ": straight-edge mapping: reverse/local=" & reverseMatches & _
+        "; forward=" & forwardMatches & "; missing=" & missingMatches & "; API errors=" & correspondenceErrors
+    Debug.Print LOG_PREFIX & ": reverse results: Nothing/error=" & reverseNulls & "; wrong type=" & reverseWrongTypes & _
+        "; not in source geometry=" & reverseNonLocal
     For i = 1 To bodies.Count
         bodiesSeen = bodiesSeen + 1
         Set candidates = edgeLists(i)
@@ -326,14 +498,14 @@ Private Sub ProcessComponent(ByVal comp As SldWorks.Component2)
         If Not CBool(completeMaps(i)) Then
             Debug.Print LOG_PREFIX & " " & componentLabel & " body=" & i & ": incomplete source mapping; refusing a potentially short substitute"
         Else
-        For j = 1 To candidates.Count
-            Set edge = candidates(j)
-            If AddEdgeDimension(edge, comp) Then
-                done = True
-                Exit For
-            End If
-            If blocked Then Exit For
-        Next j
+            For j = 1 To candidates.Count
+                Set edge = candidates(j)
+                If AddEdgeDimension(edge, comp) Then
+                    done = True
+                    Exit For
+                End If
+                If blocked Then Exit For
+            Next j
         End If
         If Not done Then
             unresolved = unresolved + 1
@@ -379,7 +551,8 @@ Private Function ProjectEndpoints(ByVal a As Variant, ByVal b As Variant, ByVal 
     Set mu = swApp.GetMathUtility
     Set pa = mu.CreatePoint(a): Set pb = mu.CreatePoint(b)
     If assemblyView Then
-        Set transform = comp.Transform2
+        If sourceInstance Is Nothing Then Exit Function
+        Set transform = sourceInstance.Transform2
         If transform Is Nothing Then Exit Function
         Set pa = pa.MultiplyTransform(transform)
         Set pb = pb.MultiplyTransform(transform)
