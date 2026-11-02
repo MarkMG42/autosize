@@ -3,7 +3,7 @@ Option Explicit
 
 ' Requires SolidWorks type libraries (normal SolidWorks VBA macro project).
 ' Distances and coordinates are in metres. No document is saved automatically.
-Private Const MACRO_VERSION As String = "2.4"
+Private Const MACRO_VERSION As String = "2.4.1"
 Private Const LOG_PREFIX As String = "AutoFrameDim v" & MACRO_VERSION
 Private Const OFFSET_M As Double = 0.004
 Private Const OUTLINE_TOL_M As Double = 0.001
@@ -68,8 +68,7 @@ Public Sub main()
     Debug.Print LOG_PREFIX & ": existing dimensions preserved; rerun can create duplicates"
     SeedOccupied
     If Not assemblyView Then
-        If StrComp(referenced.ConfigurationManager.ActiveConfiguration.Name, targetView.ReferencedConfiguration, vbTextCompare) <> 0 Then _
-            Err.Raise vbObjectError + 30, , "Activate the drawing's referenced configuration in the part before running."
+        CheckSourceConfiguration referenced, targetView.ReferencedConfiguration, "part view"
     End If
     Dim comps As Variant
     comps = targetView.GetVisibleComponents
@@ -152,6 +151,28 @@ Private Function ComponentName(ByVal comp As SldWorks.Component2) As String
     If Not comp Is Nothing Then ComponentName = comp.Name2
 End Function
 
+Private Sub CheckSourceConfiguration(ByVal model As SldWorks.ModelDoc2, _
+        ByVal requestedConfiguration As String, ByVal context As String)
+    Dim active As SldWorks.Configuration, sourceConfiguration As String
+    Set active = model.ConfigurationManager.ActiveConfiguration
+    If active Is Nothing Then Err.Raise vbObjectError + 32, , "Source active configuration unavailable: " & context
+    sourceConfiguration = active.Name
+    If Len(Trim$(sourceConfiguration)) = 0 Then _
+        Err.Raise vbObjectError + 32, , "Source active configuration name unavailable: " & context
+    If Len(Trim$(requestedConfiguration)) = 0 Then
+        ' An empty API result is UNKNOWN, not a different configuration name.
+        ' Do not switch configurations or assume an empty string means default.
+        ' Assembly source edges must still pass SourceEdge/completeMaps, and
+        ' every newly created dimension must pass the true-length readback.
+        Debug.Print LOG_PREFIX & " " & context & ": referenced configuration not reported; source=[" & _
+            sourceConfiguration & "]; proceeding with geometric validation"
+    ElseIf StrComp(sourceConfiguration, requestedConfiguration, vbTextCompare) <> 0 Then
+        Err.Raise vbObjectError + 32, , "Configuration mismatch: source=[" & sourceConfiguration & _
+            "]; referenced=[" & requestedConfiguration & "]; context=" & context & _
+            ". Activate the referenced configuration in the source model first."
+    End If
+End Sub
+
 ' Normalize to a source PART edge before any math. Never infer coordinate
 ' context from a bounding rectangle. Keep the visible edge for selection.
 Private Sub BuildLocalLookup(ByVal comp As SldWorks.Component2)
@@ -163,11 +184,7 @@ Private Sub BuildLocalLookup(ByVal comp As SldWorks.Component2)
     Set model = comp.GetModelDoc2
     If model Is Nothing Then Err.Raise vbObjectError + 21, , "Component model unavailable; resolve lightweight/suppressed components first"
     If model.GetType <> swDocPART Then Err.Raise vbObjectError + 22, , "Expected a leaf part component"
-    Dim sourceConfiguration As String
-    sourceConfiguration = model.ConfigurationManager.ActiveConfiguration.Name
-    If StrComp(sourceConfiguration, comp.ReferencedConfiguration, vbTextCompare) <> 0 Then _
-        Err.Raise vbObjectError + 32, , "Configuration mismatch: source=" & sourceConfiguration & _
-        "; instance=" & comp.ReferencedConfiguration & ". Activate the instance configuration in the part first."
+    CheckSourceConfiguration model, comp.ReferencedConfiguration, ComponentName(comp)
     Set part = model
     Dim bs As Variant, es As Variant, i As Long, j As Long
     Dim body As SldWorks.Body2, edge As SldWorks.Edge, mapped As Object
