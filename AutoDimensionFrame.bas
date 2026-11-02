@@ -3,7 +3,7 @@ Option Explicit
 
 ' Requires SolidWorks type libraries (normal SolidWorks VBA macro project).
 ' Distances and coordinates are in metres. No document is saved automatically.
-Private Const MACRO_VERSION As String = "2.4.2"
+Private Const MACRO_VERSION As String = "2.4.3"
 Private Const LOG_PREFIX As String = "AutoFrameDim v" & MACRO_VERSION
 Private Const OFFSET_M As Double = 0.004
 Private Const OUTLINE_TOL_M As Double = 0.001
@@ -25,6 +25,7 @@ Private localEdges As Collection, instanceEdges As Collection, assemblyEdges As 
 Private viewModel As SldWorks.ModelDoc2, sourceModel As SldWorks.ModelDoc2
 Private sourceInstance As SldWorks.Component2
 Private modelComponents As Variant
+Private drawingRootName As String, drawingRootAlias As String
 Private reverseMatches As Long, forwardMatches As Long, missingMatches As Long
 Private correspondenceErrors As Long, forwardBuilt As Boolean
 Private reverseErrors As Long, assemblyErrors As Long, viewErrors As Long
@@ -46,6 +47,7 @@ Public Sub main()
     Set sourceModel = Nothing
     Set sourceInstance = Nothing
     modelComponents = Empty
+    drawingRootName = "": drawingRootAlias = ""
     Debug.Print LOG_PREFIX & " START " & CStr(Now)
     Set swApp = Application.SldWorks
     Set doc = swApp.ActiveDoc
@@ -85,6 +87,7 @@ Public Sub main()
         Set assembly = referenced
         modelComponents = assembly.GetComponents(False)
         If Not HasItems(modelComponents) Then Err.Raise vbObjectError + 33, , "Referenced assembly has no accessible model components"
+        CaptureDrawingRoot
     End If
     Dim comps As Variant
     comps = targetView.GetVisibleComponents
@@ -189,36 +192,102 @@ Private Sub CheckSourceConfiguration(ByVal model As SldWorks.ModelDoc2, _
     End If
 End Sub
 
+Private Sub CaptureDrawingRoot()
+    Dim drawingRoot As SldWorks.DrawingComponent, rootComponent As SldWorks.Component2
+    Set drawingRoot = targetView.RootDrawingComponent
+    If Not drawingRoot Is Nothing Then
+        drawingRootName = drawingRoot.Name
+        Set rootComponent = drawingRoot.Component
+        If Not rootComponent Is Nothing Then drawingRootAlias = rootComponent.Name2
+    End If
+    Debug.Print LOG_PREFIX & ": drawing root=[" & drawingRootName & "]; root component=[" & drawingRootAlias & "]"
+    Debug.Print LOG_PREFIX & ": model component count=" & (UBound(modelComponents) - LBound(modelComponents) + 1)
+    Dim i As Long, candidate As SldWorks.Component2
+    For i = LBound(modelComponents) To UBound(modelComponents)
+        If i - LBound(modelComponents) >= 8 Then Exit For
+        Set candidate = modelComponents(i)
+        If Not candidate Is Nothing Then Debug.Print LOG_PREFIX & ": model tree sample=[" & candidate.Name2 & "]"
+    Next i
+End Sub
+
+Private Function ComponentNameMatches(ByVal requested As String, ByVal actual As String, _
+        ByVal rootName As String, ByVal rootAlias As String) As Boolean
+    ' Keep actual intact. Compare both legitimate drawing representations.
+    ' Never strip arbitrary ancestors, match basenames or discard nesting.
+    ComponentNameMatches = (StrComp(requested, actual, vbTextCompare) = 0)
+    If Len(rootName) > 0 Then
+        ComponentNameMatches = ComponentNameMatches Or (StrComp(requested, rootName & "/" & actual, vbTextCompare) = 0)
+    End If
+    If Len(rootAlias) > 0 Then
+        ComponentNameMatches = ComponentNameMatches Or (StrComp(requested, rootAlias & "/" & actual, vbTextCompare) = 0)
+    End If
+End Function
+
+Private Function ComponentMetadataMatches(ByVal candidate As SldWorks.Component2, ByVal requestedPath As String, _
+        ByVal requestedConfiguration As String, ByRef pathRejected As Long, ByRef configRejected As Long) As Boolean
+    If Len(requestedPath) > 0 Then
+        If StrComp(Replace(candidate.GetPathName, "/", "\"), Replace(requestedPath, "/", "\"), vbTextCompare) <> 0 Then
+            pathRejected = pathRejected + 1
+            Debug.Print LOG_PREFIX & ": rejected model path: instance=[" & candidate.Name2 & "]; actual=[" & _
+                candidate.GetPathName & "]; drawing=[" & requestedPath & "]"
+            Exit Function
+        End If
+    End If
+    If Len(Trim$(requestedConfiguration)) > 0 Then
+        If StrComp(candidate.ReferencedConfiguration, requestedConfiguration, vbTextCompare) <> 0 Then
+            configRejected = configRejected + 1
+            Debug.Print LOG_PREFIX & ": rejected model configuration: instance=[" & candidate.Name2 & "]; actual=[" & _
+                candidate.ReferencedConfiguration & "]; drawing=[" & requestedConfiguration & "]"
+            Exit Function
+        End If
+    End If
+    ComponentMetadataMatches = True
+End Function
+
 Private Function ResolveModelComponent(ByVal drawingComponent As SldWorks.Component2) As SldWorks.Component2
-    ' Drawing components are not assumed to be assembly-document components.
-    ' First use the target document's corresponding-object conversion; validate
-    ' its identity against the actual assembly tree before accepting it.
     Dim normalized As Object, candidate As SldWorks.Component2, found As SldWorks.Component2
-    Dim i As Long, matches As Long, requestedPath As String
+    Dim i As Long, matches As Long, requestedPath As String, requestedConfiguration As String
+    Dim requestedName As String, nameMatches As Long, pathRejected As Long, configRejected As Long
+    requestedName = drawingComponent.Name2
+    requestedPath = drawingComponent.GetPathName
+    requestedConfiguration = drawingComponent.ReferencedConfiguration
     Set normalized = TryCorrespondingObject(viewModel, drawingComponent)
     If Not normalized Is Nothing Then
         For i = LBound(modelComponents) To UBound(modelComponents)
             Set candidate = modelComponents(i)
-            If swApp.IsSame(normalized, candidate) = swObjectSame Then
-                Set ResolveModelComponent = candidate
-                Exit Function
+            If Not candidate Is Nothing Then
+                If swApp.IsSame(normalized, candidate) = swObjectSame Then
+                    If ComponentMetadataMatches(candidate, requestedPath, requestedConfiguration, pathRejected, configRejected) Then
+                        Set ResolveModelComponent = candidate
+                        Debug.Print LOG_PREFIX & ": resolved by API: drawing=[" & requestedName & "]; model=[" & candidate.Name2 & "]"
+                        Exit Function
+                    End If
+                End If
             End If
         Next i
     End If
-    ' A unique FULL hierarchical name is acceptable; basename-only matching is not.
-    requestedPath = drawingComponent.GetPathName
+    pathRejected = 0: configRejected = 0
+    ' Count the UNION of exact and verified-root-prefixed matches once per
+    ' actual instance. A root-name collision must remain ambiguous, not first-win.
     For i = LBound(modelComponents) To UBound(modelComponents)
         Set candidate = modelComponents(i)
-        If StrComp(candidate.Name2, drawingComponent.Name2, vbTextCompare) = 0 Then
-            If Len(requestedPath) = 0 Or StrComp(candidate.GetPathName, requestedPath, vbTextCompare) = 0 Then
-                matches = matches + 1
-                Set found = candidate
+        If Not candidate Is Nothing Then
+            If ComponentNameMatches(requestedName, candidate.Name2, drawingRootName, drawingRootAlias) Then
+                nameMatches = nameMatches + 1
+                If ComponentMetadataMatches(candidate, requestedPath, requestedConfiguration, pathRejected, configRejected) Then
+                    matches = matches + 1
+                    Set found = candidate
+                End If
             End If
         End If
     Next i
+    Debug.Print LOG_PREFIX & ": component resolution: drawing=[" & requestedName & "]; name matches=" & nameMatches & _
+        "; path rejected=" & pathRejected & "; config rejected=" & configRejected & "; accepted=" & matches
     If matches <> 1 Then Err.Raise vbObjectError + 34, , _
-        "Cannot uniquely resolve drawing component in assembly tree: " & drawingComponent.Name2 & "; matches=" & matches
+        "Cannot uniquely resolve drawing component: " & requestedName & "; matches=" & matches & _
+        "; name matches=" & nameMatches & "; path rejected=" & pathRejected & "; config rejected=" & configRejected
     Set ResolveModelComponent = found
+    Debug.Print LOG_PREFIX & ": resolved by full hierarchy: drawing=[" & requestedName & "]; model=[" & found.Name2 & "]"
 End Function
 
 Private Function TryCorrespondingObject(ByVal model As SldWorks.ModelDoc2, ByVal item As Object) As Object
