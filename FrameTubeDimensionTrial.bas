@@ -1,11 +1,11 @@
 Attribute VB_Name = "FrameTubeDimensionTrial"
 Option Explicit
 
-' ONE tube boundary dimension. The user selects any real edge of the tube
+' ONE tube boundary dimension. The user selects an edge or silhouette of the tube
 ' body; the macro finds a visible full-length plane/cylinder boundary after
 ' temporarily showing tangent edges. Original view mode/settings are restored.
 ' Standard SldWorks/SwConst only. No rebuild, model edit, override or save.
-Private Const PREFIX As String = "FrameTubeDimensionTrial v1.0"
+Private Const PREFIX As String = "FrameTubeDimensionTrial v1.1"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -50,22 +50,48 @@ Public Sub main()
     preferenceCaptured = False: tangentCaptured = False: outputPath = ""
     OpenLog
     LogLine "START " & CStr(Now)
-    LogLine "ONE tube boundary trial; initial edge only identifies the body. Rerun may add a duplicate."
+    LogLine "ONE tube boundary trial; initial edge/silhouette only identifies the body. Rerun may add a duplicate."
     Set app = Application.SldWorks
     Set drawing = app.ActiveDoc
     If drawing Is Nothing Then Err.Raise vbObjectError + 1, , "Open the drawing first."
     If drawing.GetType <> swDocDRAWING Then Err.Raise vbObjectError + 2, , "Active document must be a drawing."
-    Dim sm As SldWorks.SelectionMgr, picked As SldWorks.Edge
+    Dim sm As SldWorks.SelectionMgr, picked As Object, selectedIndex As Long
     Set sm = drawing.SelectionManager
-    Set picked = ReadSelectedFrameEdge(sm, view)
+    Set picked = ReadSelectedTubeGeometry(sm, view, selectedIndex)
     If ApiBoolean(view.ProjectedDimensions) Then Err.Raise vbObjectError + 30, , "Set view dimension type to True, not Projected. View dimension type was not changed."
-    ResolveContext picked
-    Dim converted As Object, identifyingEdge As SldWorks.Edge
-    Set converted = frameModel.Extension.GetCorrespondingEntity2(picked)
-    If converted Is Nothing Then Err.Raise vbObjectError + 31, , "Selected edge has no source correspondence."
-    If Not TypeOf converted Is SldWorks.Edge Then Err.Raise vbObjectError + 32, , "Selected source object is not a real Edge."
-    Set identifyingEdge = converted
-    Set selectedBody = identifyingEdge.GetBody
+    Dim seed As Object, converted As Object, identifyingEdge As SldWorks.Edge
+    Dim silhouette As SldWorks.SilhouetteEdge, identifyingFace As SldWorks.Face2, silhouetteView As SldWorks.View
+    Dim silhouetteSeed As Boolean
+    If TypeOf picked Is SldWorks.Edge Then
+        Set identifyingEdge = picked
+        ResolveContext identifyingEdge
+        Set seed = identifyingEdge
+    ElseIf TypeOf picked Is SldWorks.SilhouetteEdge Then
+        silhouetteSeed = True
+        Set silhouette = picked
+        Set silhouetteView = silhouette.GetView
+        If silhouetteView Is Nothing Then Err.Raise vbObjectError + 90, , "Selected silhouette has no view."
+        If StrComp(silhouetteView.GetName2, view.GetName2, vbBinaryCompare) <> 0 Then _
+            Err.Raise vbObjectError + 91, , "Silhouette view does not match selection view."
+        Set identifyingFace = silhouette.GetFace
+        If identifyingFace Is Nothing Then Err.Raise vbObjectError + 92, , "Selected silhouette has no supporting face."
+        LogLine "SILHOUETTE seed index=" & selectedIndex & "; supporting face identifies body only; silhouette will NOT be dimensioned"
+        ResolveSilhouetteContext identifyingFace, sm, selectedIndex
+        Set seed = identifyingFace
+    Else
+        Err.Raise vbObjectError + 93, , "Unsupported tube selection object."
+    End If
+    Set converted = frameModel.Extension.GetCorrespondingEntity2(seed)
+    If converted Is Nothing Then Err.Raise vbObjectError + 31, , "Selected seed has no source-part correspondence."
+    If silhouetteSeed Then
+        If Not TypeOf converted Is SldWorks.Face2 Then Err.Raise vbObjectError + 32, , "Silhouette face did not map to a source Face2."
+        Set identifyingFace = converted
+        Set selectedBody = identifyingFace.GetBody
+    Else
+        If Not TypeOf converted Is SldWorks.Edge Then Err.Raise vbObjectError + 32, , "Selected edge did not map to a source Edge."
+        Set identifyingEdge = converted
+        Set selectedBody = identifyingEdge.GetBody
+    End If
     If selectedBody Is Nothing Then Err.Raise vbObjectError + 33, , "Selected source body unavailable."
     LogLine "TARGET BODY=[" & selectedBody.Name & "]; native self identity=" & app.IsSame(selectedBody, selectedBody)
     If app.IsSame(selectedBody, selectedBody) <> swObjectSame Then Err.Raise vbObjectError + 34, , "Body identity self-check failed."
@@ -505,6 +531,45 @@ Private Function FindPosition(ByVal halfWidth As Double, ByVal halfHeight As Dou
     Next level
 End Function
 
+Private Sub ResolveSilhouetteContext(ByVal face As SldWorks.Face2, _
+        ByVal sm As SldWorks.SelectionMgr, ByVal selectedIndex As Long)
+    If face Is Nothing Then Err.Raise vbObjectError + 92, , "Silhouette supporting face unavailable."
+    Dim reference As SldWorks.ModelDoc2, rawComponent As Object
+    Dim component As SldWorks.Component2, dc As SldWorks.DrawingComponent
+    Set reference = view.ReferencedDocument
+    If reference Is Nothing Then Err.Raise vbObjectError + 6, , "Resolve/open the referenced model first."
+    LogLine "VIEW=[" & view.GetName2 & "]; reference=[" & reference.GetTitle & "]; config=[" & view.ReferencedConfiguration & "]"
+    CheckConfiguration reference, view.ReferencedConfiguration
+    If reference.GetType = swDocASSEMBLY Then
+        ' The supporting face may be part-context and cannot identify which of
+        ' several identical instances was picked. Use the actual selection index.
+        Set rawComponent = sm.GetSelectedObjectsComponent4(selectedIndex, -1)
+        If rawComponent Is Nothing Then Err.Raise vbObjectError + 94, , "Selected silhouette component unavailable; choose an ordinary tube end edge."
+        If Not TypeOf rawComponent Is SldWorks.Component2 Then _
+            Err.Raise vbObjectError + 95, , "Silhouette selection did not identify a Component2."
+        Set component = rawComponent
+        LogLine "SILHOUETTE selected component=[" & component.Name2 & "]; index=" & selectedIndex
+        Set frameInstance = ResolveFrameInstance(reference, component)
+        Set frameModel = frameInstance.GetModelDoc2
+        If frameModel Is Nothing Then Err.Raise vbObjectError + 9, , "Resolve/open the selected frame part first."
+        CheckConfiguration frameModel, frameInstance.ReferencedConfiguration
+        Set dc = frameInstance.GetDrawingComponent(view)
+        If dc Is Nothing Then Err.Raise vbObjectError + 96, , "Selected frame instance has no drawing component in this view."
+        Set frameDrawingComponent = dc.Component
+        If frameDrawingComponent Is Nothing Then Err.Raise vbObjectError + 8, , "Selected frame drawing component unavailable."
+        LogLine "FRAME INSTANCE=[" & frameInstance.Name2 & "]; config=[" & frameInstance.ReferencedConfiguration & "]"
+    ElseIf reference.GetType = swDocPART Then
+        Set frameModel = reference
+        Set dc = view.RootDrawingComponent
+        If Not dc Is Nothing Then Set frameDrawingComponent = dc.Component
+        If frameDrawingComponent Is Nothing Then Err.Raise vbObjectError + 67, , "Part-view drawing component unavailable."
+    Else
+        Err.Raise vbObjectError + 10, , "Only assembly and part references supported."
+    End If
+    If frameModel.GetType <> swDocPART Then Err.Raise vbObjectError + 11, , "Selected frame must be a PART."
+    LogLine "FRAME MODEL=[" & frameModel.GetTitle & "]; path=[" & frameModel.GetPathName & "]"
+End Sub
+
 Private Sub ResolveContext(ByVal selectedEdge As SldWorks.Edge)
     Dim reference As SldWorks.ModelDoc2
     Set reference = view.ReferencedDocument
@@ -706,44 +771,38 @@ ClearFailed:
     LogLine "SELECTION CLEANUP ERROR: " & Err.Number & ": " & Err.Description
 End Sub
 
-Private Function ReadSelectedFrameEdge(ByVal sm As SldWorks.SelectionMgr, _
-        ByRef selectedView As SldWorks.View) As SldWorks.Edge
-    Dim count As Long, edges As Long, i As Long, selectionType As Long
-    Dim item As Object, candidate As SldWorks.Edge, itemView As SldWorks.View
+Private Function ReadSelectedTubeGeometry(ByVal sm As SldWorks.SelectionMgr, _
+        ByRef selectedView As SldWorks.View, ByRef selectedIndex As Long) As Object
+    Dim count As Long, geometryCount As Long, i As Long, selectionType As Long
+    Dim item As Object, candidate As Object, itemView As SldWorks.View
     count = sm.GetSelectedObjectCount2(-1)
     LogLine "SELECTION total=" & count
-    If count = 0 Then Err.Raise vbObjectError + 3, , _
-        "Selection is empty at macro start. Click a frame edge, then run via Tools > Macro > Run. " & _
-        "Select the frame edge in this drawing before running the macro."
+    If count = 0 Then Err.Raise vbObjectError + 3, , "Select one tube edge or silhouette in the drawing before running."
     For i = 1 To count
         selectionType = sm.GetSelectedObjectType3(i, -1)
         Set item = sm.GetSelectedObject6(i, -1)
         Set itemView = sm.GetSelectedObjectsDrawingView2(i, -1)
         If i <= 30 Then
             LogLine "SELECTION index=" & i & "; API type=" & selectionType & "; object=" & TypeName(item)
-            If itemView Is Nothing Then
-                LogLine "  drawing view=Nothing"
-            Else
-                LogLine "  drawing view=[" & itemView.GetName2 & "]"
-            End If
+            If Not itemView Is Nothing Then LogLine "  drawing view=[" & itemView.GetName2 & "]"
         End If
-        If selectionType = swSelEDGES Then
-            edges = edges + 1
-            If edges = 1 Then
-                If Not item Is Nothing Then
-                    If TypeOf item Is SldWorks.Edge Then Set candidate = item
-                End If
+        If selectionType = swSelEDGES Or selectionType = swSelSILHOUETTES Then
+            geometryCount = geometryCount + 1
+            If geometryCount = 1 Then
+                selectedIndex = i
                 Set selectedView = itemView
+                If Not item Is Nothing Then
+                    If selectionType = swSelEDGES And TypeOf item Is SldWorks.Edge Then Set candidate = item
+                    If selectionType = swSelSILHOUETTES And TypeOf item Is SldWorks.SilhouetteEdge Then Set candidate = item
+                End If
             End If
         End If
     Next i
-    LogLine "SELECTION edge count=" & edges & "; other selections=" & (count - edges)
-    If edges <> 1 Then Err.Raise vbObjectError + 3, , _
-        "Expected ONE edge; found edges=" & edges & "; total selections=" & count & _
-        ". Press Esc in the drawing, click one frame edge, then run the macro."
-    If candidate Is Nothing Then Err.Raise vbObjectError + 4, , "Selected edge object unavailable or not SldWorks.Edge."
-    If selectedView Is Nothing Then Err.Raise vbObjectError + 5, , "Selected edge has no drawing view."
-    Set ReadSelectedFrameEdge = candidate
+    LogLine "SELECTION tube geometry count=" & geometryCount & "; selected index=" & selectedIndex & "; other selections=" & (count - geometryCount)
+    If geometryCount <> 1 Then Err.Raise vbObjectError + 3, , "Expected ONE tube edge or silhouette; found=" & geometryCount
+    If candidate Is Nothing Then Err.Raise vbObjectError + 4, , "Selected tube geometry object unavailable or unsupported."
+    If selectedView Is Nothing Then Err.Raise vbObjectError + 5, , "Selected tube geometry has no drawing view."
+    Set ReadSelectedTubeGeometry = candidate
 End Function
 
 Private Sub OpenLog()
