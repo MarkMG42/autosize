@@ -423,8 +423,10 @@ Private Function TryCreateDimension(ByVal visible As SldWorks.Edge, ByVal source
     If Not fmt Is Nothing Then
         If fmt.CharHeight > height Then height = fmt.CharHeight
     End If
-    halfWidth = EstimateHalfWidth(expectedLength, height)
-    If FindPosition(halfWidth, height, x, y) = False Then Err.Raise vbObjectError + 54, , "No free slot for actual font."
+    If height > 0.004 Then
+        halfWidth = EstimateHalfWidth(expectedLength, height)
+        If FindPosition(halfWidth, height, x, y) = False Then Err.Raise vbObjectError + 54, , "No free slot for actual font."
+    End If
     p = MoveAnnotationToTarget(ann, x, y)
     RequirePosition p
     If Abs(p(0) - x) > POSITION_TOL_M Or Abs(p(1) - y) > POSITION_TOL_M Then Err.Raise vbObjectError + 55, , "Final position did not converge."
@@ -696,12 +698,23 @@ End Function
 
 Private Function VertexPairMatchesSourceEdge(ByVal index As Long, ByVal va As SldWorks.Vertex, ByVal vb As SldWorks.Vertex) As Boolean
     Dim a As Variant, b As Variant, p As Variant, q As Variant, edges As Variant
-    Dim edge As SldWorks.Edge, length As Double, i As Long
+    Dim edge As SldWorks.Edge, length As Double, i As Long, first As Long, last As Long
+    Dim useCache As Boolean
     a = va.GetPoint: b = vb.GetPoint
-    edges = jobs(index).Body.GetEdges
-    If HasItems(edges) = False Then Exit Function
-    For i = LBound(edges) To UBound(edges)
-        Set edge = edges(i)
+    useCache = (jobs(index).FullLengthEdges.Count > 0)
+    If useCache Then
+        first = 1: last = jobs(index).FullLengthEdges.Count
+    Else
+        edges = jobs(index).Body.GetEdges
+        If HasItems(edges) = False Then Exit Function
+        first = LBound(edges): last = UBound(edges)
+    End If
+    For i = first To last
+        If useCache Then
+            Set edge = jobs(index).FullLengthEdges(i)
+        Else
+            Set edge = edges(i)
+        End If
         If StraightGeometry(edge, p, q, length) Then
             If Abs(length - jobs(index).Expected) <= LENGTH_TOL_M Then
                 If (SamePoint(a, p) And SamePoint(b, q)) Or (SamePoint(a, q) And SamePoint(b, p)) Then
@@ -956,8 +969,10 @@ Private Sub VerifySingleSelection(ByVal sm As SldWorks.SelectionMgr)
     Set localEdge = localObject
     Set body = localEdge.GetBody
     If body Is Nothing Then Err.Raise vbObjectError + 77, , "Dimension selection source body unavailable."
-    LogLine "BOUND SELECTION BODY=[" & body.Name & "]; IsSame target=" & app.IsSame(body, selectedBody)
-    If app.IsSame(body, selectedBody) <> swObjectSame Or StrComp(body.Name, selectedBody.Name, vbBinaryCompare) <> 0 Then _
+    Dim sameBody As Long
+    sameBody = app.IsSame(body, selectedBody)
+    LogLine "BOUND SELECTION BODY=[" & body.Name & "]; IsSame target=" & sameBody
+    If sameBody <> swObjectSame Or StrComp(body.Name, selectedBody.Name, vbBinaryCompare) <> 0 Then _
         Err.Raise vbObjectError + 78, , "Dimension selection is not attached to the target frame body."
 End Sub
 
@@ -1123,7 +1138,7 @@ Private Function ResolveFrameInstance(ByVal model As SldWorks.ModelDoc2, _
     Dim candidate As SldWorks.Component2, found As SldWorks.Component2
     Dim root As SldWorks.DrawingComponent, rootComp As SldWorks.Component2
     Dim rootName As String, rootAlias As String, sameName As Boolean
-    Dim path As String, config As String
+    Dim path As String, config As String, requestedName As String, candidateName As String
     Set root = view.RootDrawingComponent
     If Not root Is Nothing Then
         rootName = root.Name
@@ -1134,13 +1149,15 @@ Private Function ResolveFrameInstance(ByVal model As SldWorks.ModelDoc2, _
     all = assembly.GetComponents(False)
     If Not HasItems(all) Then Err.Raise vbObjectError + 14, , "Referenced assembly component tree unavailable."
     path = requested.GetPathName: config = requested.ReferencedConfiguration
-    LogLine "DRAWING COMPONENT=[" & requested.Name2 & "]; root=[" & rootName & "]; root alias=[" & rootAlias & "]"
+    requestedName = requested.Name2
+    LogLine "DRAWING COMPONENT=[" & requestedName & "]; root=[" & rootName & "]; root alias=[" & rootAlias & "]"
     For i = LBound(all) To UBound(all)
         Set candidate = all(i)
         If Not candidate Is Nothing Then
-            sameName = (StrComp(requested.Name2, candidate.Name2, vbTextCompare) = 0)
-            If Len(rootName) > 0 Then sameName = sameName Or (StrComp(requested.Name2, rootName & "/" & candidate.Name2, vbTextCompare) = 0)
-            If Len(rootAlias) > 0 Then sameName = sameName Or (StrComp(requested.Name2, rootAlias & "/" & candidate.Name2, vbTextCompare) = 0)
+            candidateName = candidate.Name2
+            sameName = (StrComp(requestedName, candidateName, vbTextCompare) = 0)
+            If Len(rootName) > 0 Then sameName = sameName Or (StrComp(requestedName, rootName & "/" & candidateName, vbTextCompare) = 0)
+            If Len(rootAlias) > 0 Then sameName = sameName Or (StrComp(requestedName, rootAlias & "/" & candidateName, vbTextCompare) = 0)
             If sameName Then
                 If Len(path) > 0 Then sameName = (StrComp(Replace(path, "/", "\"), Replace(candidate.GetPathName, "/", "\"), vbTextCompare) = 0)
                 If Len(Trim$(config)) > 0 Then sameName = sameName And (StrComp(config, candidate.ReferencedConfiguration, vbTextCompare) = 0)
@@ -1372,7 +1389,8 @@ End Sub
 
 
 
-Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks.Edge) As Boolean
+Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks.Edge, _
+        ByRef centre As Variant, ByRef centreReady As Boolean) As Boolean
     On Error GoTo Rejected
     Dim body As SldWorks.Body2, a As Variant, b As Variant, length As Double
     Dim mapped As SldWorks.Edge, i As Long, prior As SldWorks.Edge, score As Double, insertAt As Long
@@ -1394,9 +1412,13 @@ Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks
     dx = pb(0) - pa(0): dy = pb(1) - pa(1)
     If Sqr(dx * dx + dy * dy) < 0.00001 Then Exit Function
     ' Never share another body's centre. This is only a radial ranking heuristic.
-    box = jobs(index).Body.GetBodyBox
-    If HasItems(box) = False Then Exit Function
-    sourceCentre = Array((box(0) + box(3)) / 2#, (box(1) + box(4)) / 2#, (box(2) + box(5)) / 2#)
+    If centreReady = False Then
+        box = jobs(index).Body.GetBodyBox
+        If HasItems(box) = False Then Exit Function
+        centre = Array((box(0) + box(3)) / 2#, (box(1) + box(4)) / 2#, (box(2) + box(5)) / 2#)
+        centreReady = True
+    End If
+    sourceCentre = centre
     score = RadialScore(a, b, length)
     Set mapped = MapSourceBoundaryToView(source)
     If mapped Is Nothing Then Exit Function
@@ -1481,6 +1503,7 @@ End Sub
 Private Sub PrepareSourceBody(ByVal index As Long)
     On Error GoTo Unsupported
     Dim bodyStarted As Double, i As Long, source As SldWorks.Edge, accepted As Long
+    Dim centre As Variant, centreReady As Boolean
     bodyStarted = Timer
     LogLine "BEGIN cached source preparation; body=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
         "; cached edges=" & jobs(index).FullLengthEdges.Count
@@ -1498,7 +1521,7 @@ Private Sub PrepareSourceBody(ByVal index As Long)
             GoTo TimedOut
         End If
         Set source = jobs(index).FullLengthEdges(i)
-        If AddSourceBoundary(index, source) Then accepted = accepted + 1
+        If AddSourceBoundary(index, source, centre, centreReady) Then accepted = accepted + 1
     Next i
     LogLine "DONE cached source preparation; body=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
         "; elapsed seconds=" & ElapsedSeconds(bodyStarted, Timer) & "; accepted boundaries=" & accepted & _
