@@ -4,7 +4,7 @@ Option Explicit
 ' Bulk true lengths for cut-list bodies of ONE explicitly selected frame part.
 ' No other assembly components are dimensioned. No model saves/rebuilds,
 ' configuration switches or text/value overrides. Standard SldWorks/SwConst only.
-Private Const PREFIX As String = "FrameCutListDimensionsV2 v2.0"
+Private Const PREFIX As String = "FrameCutListDimensionsV2 v2.1"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -42,7 +42,7 @@ Private frameDrawingComponent As SldWorks.Component2
 Private selectedBody As SldWorks.Body2
 Private expectedLength As Double
 Private visited As Collection, occupied As Collection
-Private output As Object
+Private logAvailable As Boolean
 Private outputPath As String
 Private preferenceCaptured As Boolean, oldInputPreference As Boolean
 Private sheetWidth As Double, sheetHeight As Double
@@ -50,7 +50,6 @@ Private sheetA As Variant, sheetB As Variant, sheetCentre As Variant
 Private blocked As Boolean, queueComplete As Boolean
 Private ignoredExisting As Long, unresolvedExisting As Long, unknownExisting As Long
 Private resultSummary As String, resultWarning As Boolean
-Private tangentCaptured As Boolean, oldTangentMode As Long
 Private seedFace As SldWorks.Face2, supportFace As SldWorks.Face2
 Private supportFaces As Collection
 Private sourceCentre As Variant
@@ -64,7 +63,7 @@ Public Sub main()
     Set seedFace = Nothing: Set supportFace = Nothing
     Set visited = New Collection: Set occupied = New Collection: Set supportFaces = New Collection
     Erase jobs
-    jobCount = 0: currentJob = 0: preferenceCaptured = False: tangentCaptured = False
+    jobCount = 0: currentJob = 0: preferenceCaptured = False
     blocked = False: queueComplete = False
     ignoredExisting = 0: unresolvedExisting = 0: unknownExisting = 0
     resultSummary = "": resultWarning = False: outputPath = ""
@@ -112,6 +111,7 @@ Public Sub main()
         If jobs(i).NormalCount > 0 Then jobs(i).Route = "normal visible edge"
     Next i
     InspectExistingDimensions
+    If blocked = False And NeedSupportPhase Then DiscoverSupportFaces
     LogLine "PHASE 1: normal visible-edge candidates, original view style"
     For i = 1 To jobCount
         If blocked Then Exit For
@@ -121,15 +121,7 @@ Public Sub main()
         End If
     Next i
     If blocked = False And NeedSupportPhase Then
-        ' Capture BEFORE the first setter: even a failing setter requires restore.
-        oldTangentMode = view.GetDisplayTangentEdges2
-        If oldTangentMode < 0 Or oldTangentMode > 2 Then Err.Raise vbObjectError + 94, , "Unsupported original tangent mode."
-        tangentCaptured = True
-        LogLine "PHASE 2: source-face boundaries; original tangent mode=" & oldTangentMode
-        view.SetDisplayTangentEdges2 swTangentEdgesVisible
-        If view.GetDisplayTangentEdges2 <> swTangentEdgesVisible Then Err.Raise vbObjectError + 95, , "Cannot show tangent edges."
-        drawing.GraphicsRedraw2
-        DiscoverSupportFaces
+        LogLine "PHASE 2: precollected source-face boundaries; view style unchanged"
         For i = 1 To jobCount
             If blocked Then Exit For
             If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then
@@ -144,7 +136,7 @@ Public Sub main()
             End If
         Next i
     End If
-    FinishSettingsAndValidate
+    FinishAndValidate
     ClearSelectionSafely
     FinalReport
     CloseLog
@@ -160,7 +152,7 @@ Failed:
     message = CStr(Err.Number) & ": " & Err.Description
     blocked = True
     LogLine "STOP " & message
-    FinishSettingsAndValidate
+    FinishAndValidate
     ClearSelectionSafely
     FinalReport
     CloseLog
@@ -315,7 +307,9 @@ End Function
 
 Private Sub BuildVisibleCandidates()
     Dim edges As Variant, item As Object, i As Long, found As Long, rejected As Long
+    LogLine "BEGIN normal candidates GetVisibleEntities2 Edge1; target frame component only"
     edges = view.GetVisibleEntities2(frameDrawingComponent, swViewEntityType_Edge)
+    LogLine "DONE normal candidates GetVisibleEntities2 Edge1"
     If HasItems(edges) = False Then
         LogLine "VISIBLE target frame component has no accessible visible edges."
         Exit Sub
@@ -393,10 +387,16 @@ Private Function TryCreateDimension(ByVal visible As SldWorks.Edge, ByVal source
     height = 0.004: halfWidth = EstimateHalfWidth(expectedLength, height)
     If FindPosition(halfWidth, height, x, y) = False Then Err.Raise vbObjectError + 48, , "No free local text slot for candidate."
     drawing.ClearSelection2 True
-    If ApiBoolean(view.SelectEntity(visible, False)) = False Then Err.Raise vbObjectError + 49, , "Cannot select candidate real edge in target view."
+    Dim selectionOK As Boolean
+    LogLine "BEGIN view.SelectEntity; body=[" & selectedBody.Name & "]; route=" & jobs(currentJob).Route
+    selectionOK = ApiBoolean(view.SelectEntity(visible, False))
+    LogLine "DONE view.SelectEntity; body=[" & selectedBody.Name & "]; returned=" & selectionOK
+    If selectionOK = False Then Err.Raise vbObjectError + 49, , "Cannot select candidate real edge in target view."
     VerifySingleSelection drawing.SelectionManager
     attempted = True
+    LogLine "BEGIN AddDimension2; body=[" & selectedBody.Name & "]; expected mm=" & expectedLength * 1000#
     Set dd = drawing.AddDimension2(x, y, 0#)
+    LogLine "DONE AddDimension2; body=[" & selectedBody.Name & "]; returned handle=" & (Not dd Is Nothing)
     If dd Is Nothing Then Err.Raise vbObjectError + 50, , "AddDimension2 returned Nothing; creation outcome uncertain."
     Dim value As SldWorks.Dimension, ann As SldWorks.Annotation, fmt As SldWorks.TextFormat, p As Variant, actual As Double
     Set value = dd.GetDimension2(0)
@@ -970,9 +970,15 @@ Private Function RemoveNewDimension(ByVal dd As SldWorks.DisplayDimension) As Bo
     Set ann = dd.GetAnnotation
     If ann Is Nothing Then Exit Function
     drawing.ClearSelection2 True
-    If ApiBoolean(ann.Select3(False, Nothing)) = False Then Exit Function
+    Dim selected As Boolean
+    LogLine "BEGIN cleanup current new annotation Select3"
+    selected = ApiBoolean(ann.Select3(False, Nothing))
+    LogLine "DONE cleanup current new annotation Select3; returned=" & selected
+    If selected = False Then Exit Function
     If drawing.SelectionManager.GetSelectedObjectCount2(-1) <> 1 Then Exit Function
+    LogLine "BEGIN cleanup current new dimension DeleteSelection2"
     RemoveNewDimension = ApiBoolean(drawing.Extension.DeleteSelection2(0))
+    LogLine "DONE cleanup current new dimension DeleteSelection2; returned=" & RemoveNewDimension
     Exit Function
 CannotRemove:
     LogLine "CLEANUP ERROR: " & Err.Number & ": " & Err.Description
@@ -1028,12 +1034,13 @@ End Function
 
 Private Sub OpenLog()
     On Error GoTo NoFile
-    Dim fs As Object
+    Dim fs As Object, stream As Object
+    logAvailable = False
     Set fs = CreateObject("Scripting.FileSystemObject")
     outputPath = fs.BuildPath(fs.GetSpecialFolder(2), "FrameCutListDimensionsV2-" & fs.GetTempName & ".txt")
-    ' Unicode (UTF-16) preserves Russian component and property names.
-    ' overwrite=False protects existing files.
-    Set output = fs.CreateTextFile(outputPath, False, True)
+    Set stream = fs.CreateTextFile(outputPath, False, True)
+    stream.Close
+    logAvailable = True
     Exit Sub
 NoFile:
     outputPath = "VBA Immediate window (Ctrl+G); log file unavailable"
@@ -1042,26 +1049,26 @@ End Sub
 
 Private Sub LogLine(ByVal message As String)
     Debug.Print PREFIX & " " & message
-    If Not output Is Nothing Then WriteLogLine message
+    If logAvailable Then WriteLogLine message
 End Sub
 
 Private Sub WriteLogLine(ByVal message As String)
     On Error GoTo WriteFailed
-    output.WriteLine PREFIX & " " & message
+    Dim fs As Object, stream As Object
+    Set fs = CreateObject("Scripting.FileSystemObject")
+    ' ForAppending=8, TristateTrue=-1: close each UTF-16 line before native calls.
+    Set stream = fs.OpenTextFile(outputPath, 8, False, -1)
+    stream.WriteLine PREFIX & " " & message
+    stream.Close
     Exit Sub
 WriteFailed:
+    logAvailable = False
     Debug.Print PREFIX & " log file write failed: " & Err.Description
-    Set output = Nothing
 End Sub
 
 Private Sub CloseLog()
-    On Error GoTo CloseFailed
-    If Not output Is Nothing Then output.Close
-    Set output = Nothing
-    Exit Sub
-CloseFailed:
-    Debug.Print PREFIX & " log file close failed: " & Err.Description
-    Set output = Nothing
+    ' No stream remains open between LogLine calls.
+    logAvailable = False
 End Sub
 
 Private Function HasItems(ByVal values As Variant) As Boolean
@@ -1320,20 +1327,6 @@ Private Function RadialScore(ByVal a As Variant, ByVal b As Variant, ByVal lengt
     If RadialScore < 0# Then RadialScore = 0#
 End Function
 
-Private Function RestoreTangentMode() As Boolean
-    On Error GoTo RestoreFailed
-    If tangentCaptured Then
-        view.SetDisplayTangentEdges2 oldTangentMode
-        If view.GetDisplayTangentEdges2 <> oldTangentMode Then Err.Raise vbObjectError + 58, , "Tangent display restore readback mismatch."
-        drawing.GraphicsRedraw2
-        tangentCaptured = False
-        LogLine "TANGENT original mode restored=" & oldTangentMode
-    End If
-    RestoreTangentMode = True
-    Exit Function
-RestoreFailed:
-    LogLine "TANGENT RESTORE ERROR: " & Err.Number & ": " & Err.Description
-End Function
 
 Private Sub EnsureInputPreference()
     If preferenceCaptured = False Then
@@ -1356,67 +1349,43 @@ Private Function NeedSupportPhase() As Boolean
 End Function
 
 Private Sub DiscoverSupportFaces()
-    ' Only component-scoped API returns and an explicitly picked seed are used.
-    ' These APIs have no native completeness guarantee; counts/errors are logged.
-    DiscoverVisibleFaceKind 4  ' swViewEntityType_SilhouetteEdge
-    DiscoverVisibleFaceKind 3  ' swViewEntityType_Face
+    ' Discover adjacent source cylinder faces from ALL real visible edges.
+    ' Short/curved edges identify faces only; only verified full LENGTH edges
+    ' of those faces can later be selected for dimension creation.
+    On Error GoTo Unavailable
+    Dim edges As Variant, i As Long, item As Object, count As Long
+    LogLine "BEGIN support discovery GetVisibleEntities2 Edge1; target frame component only; before creation"
+    edges = view.GetVisibleEntities2(frameDrawingComponent, swViewEntityType_Edge)
+    LogLine "DONE support discovery GetVisibleEntities2 Edge1"
+    If HasItems(edges) Then
+        count = UBound(edges) - LBound(edges) + 1
+        For i = LBound(edges) To UBound(edges)
+            Set item = edges(i)
+            If TypeOf item Is SldWorks.Edge Then DiscoverAdjacentSupportFaces item, i
+        Next i
+    End If
+    LogLine "SOURCE FACE discovery real visible edges=" & count
     If Not seedFace Is Nothing Then AcceptSupportFace seedFace, "selected silhouette seed"
     LogLine "SOURCE FACE unique accessible cylindrical support faces=" & supportFaces.Count
-    Dim i As Long
     For i = 1 To jobCount
         If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then _
             LogLine "SOURCE FACE body=[" & jobs(i).Body.Name & "]; selectable real boundary candidates=" & jobs(i).Source.Count
     Next i
-End Sub
-
-Private Sub DiscoverVisibleFaceKind(ByVal kind As Long)
-    On Error GoTo Unavailable
-    Dim values As Variant, i As Long, count As Long, item As Object
-    Dim silhouettes As Long, faces As Long, unsupported As Long
-    values = view.GetVisibleEntities2(frameDrawingComponent, kind)
-    If HasItems(values) Then
-        count = UBound(values) - LBound(values) + 1
-        For i = LBound(values) To UBound(values)
-            Set item = values(i)
-            If TypeOf item Is SldWorks.SilhouetteEdge Then
-                silhouettes = silhouettes + 1
-            ElseIf TypeOf item Is SldWorks.Face2 Then
-                faces = faces + 1
-            Else
-                unsupported = unsupported + 1
-                LogLine "SOURCE FACE unsupported query item kind=" & kind & "; TypeName=" & TypeName(item)
-            End If
-            DiscoverFaceItem item, kind
-        Next i
-    End If
-    LogLine "SOURCE FACE target-component query kind=" & kind & "; returned objects=" & count & _
-        "; typed silhouettes=" & silhouettes & "; typed faces=" & faces & "; unsupported=" & unsupported
     Exit Sub
 Unavailable:
-    LogLine "SOURCE FACE query unavailable kind=" & kind & ": " & Err.Number & ": " & Err.Description
+    LogLine "SOURCE FACE real-edge discovery unavailable: " & Err.Number & ": " & Err.Description
+    If Not seedFace Is Nothing Then AcceptSupportFace seedFace, "selected silhouette seed after visible-edge discovery error"
 End Sub
 
-Private Sub DiscoverFaceItem(ByVal item As Object, ByVal kind As Long)
-    On Error GoTo Unavailable
-    If item Is Nothing Then Exit Sub
-    Dim face As SldWorks.Face2, silhouette As SldWorks.SilhouetteEdge
-    If TypeOf item Is SldWorks.SilhouetteEdge Then
-        Set silhouette = item
-        Set face = silhouette.GetFace
-    ElseIf TypeOf item Is SldWorks.Face2 Then
-        Set face = item
-    End If
-    If Not face Is Nothing Then AcceptSupportFace face, "target-component API kind=" & kind
-    Exit Sub
-Unavailable:
-    LogLine "SOURCE FACE item unavailable kind=" & kind & ": " & Err.Number & ": " & Err.Description
-End Sub
+
 
 Private Sub AcceptSupportFace(ByVal face As SldWorks.Face2, ByVal origin As String)
     On Error GoTo Rejected
     Dim converted As Object, source As SldWorks.Face2, body As SldWorks.Body2
     Dim index As Long, i As Long, existing As SldWorks.Face2, surface As SldWorks.Surface
+    LogLine "BEGIN support face reverse; " & origin
     Set converted = frameModel.Extension.GetCorrespondingEntity2(face)
+    LogLine "DONE support face reverse; " & origin
     If converted Is Nothing Then
         If FaceBodyIsInTargetPart(face) Then
             Set converted = face
@@ -1436,6 +1405,7 @@ Private Sub AcceptSupportFace(ByVal face As SldWorks.Face2, ByVal origin As Stri
     ' edges. This identity normalization does not discover additional faces.
     Dim localFaces As Variant, localFace As SldWorks.Face2, canonical As SldWorks.Face2
     Dim faceMatches As Long
+    LogLine "BEGIN canonical source-body face identity; body=[" & jobs(index).Body.Name & "]; " & origin
     localFaces = jobs(index).Body.GetFaces
     If HasItems(localFaces) Then
         For i = LBound(localFaces) To UBound(localFaces)
@@ -1448,7 +1418,7 @@ Private Sub AcceptSupportFace(ByVal face As SldWorks.Face2, ByVal origin As Stri
             End If
         Next i
     End If
-    LogLine "SOURCE FACE source-body canonical identity matches=" & faceMatches & "; origin=" & origin
+    LogLine "DONE canonical source-body face identity; body=[" & jobs(index).Body.Name & "]; matches=" & faceMatches & "; origin=" & origin
     If faceMatches <> 1 Then
         LogLine "SOURCE FACE rejected: canonical source-body face identity must match exactly once; no coordinate-context guess"
         Exit Sub
@@ -1472,11 +1442,15 @@ End Sub
 
 Private Sub CollectFaceEdges(ByVal index As Long, ByVal face As SldWorks.Face2)
     Dim edges As Variant, i As Long, source As SldWorks.Edge, accepted As Long
+    LogLine "BEGIN canonical face GetEdges; body=[" & jobs(index).Body.Name & "]"
     edges = face.GetEdges
+    LogLine "DONE canonical face GetEdges; body=[" & jobs(index).Body.Name & "]"
     If HasItems(edges) = False Then Exit Sub
     For i = LBound(edges) To UBound(edges)
         Set source = edges(i)
+        LogLine "BEGIN face boundary geometry/adjacency; body=[" & jobs(index).Body.Name & "]; source edge index=" & i
         If AddFaceEdge(index, source) Then accepted = accepted + 1
+        LogLine "DONE face boundary geometry/adjacency; body=[" & jobs(index).Body.Name & "]; source edge index=" & i
     Next i
     LogLine "SOURCE FACE body=[" & jobs(index).Body.Name & "]; real face edges=" & (UBound(edges) - LBound(edges) + 1) & _
         "; added full-LENGTH boundaries=" & accepted
@@ -1531,17 +1505,10 @@ Rejected:
     LogLine "SOURCE FACE edge rejected: " & Err.Number & ": " & Err.Description
 End Function
 
-Private Sub FinishSettingsAndValidate()
-    ' Always restore the style before assessing new dimensions, even on failure.
-    Dim styleRestored As Boolean
-    styleRestored = RestoreTangentMode
-    If styleRestored = False Then
-        blocked = True
-        LogLine "STOP: original tangent display mode could not be restored."
-    End If
+Private Sub FinishAndValidate()
     Dim i As Long
     For i = 1 To jobCount
-        If Not jobs(i).CreatedDD Is Nothing Then ValidateRetainedDimension i, styleRestored
+        If Not jobs(i).CreatedDD Is Nothing Then ValidateRetainedDimension i
     Next i
     If RestorePreference = False Then
         blocked = True
@@ -1549,46 +1516,71 @@ Private Sub FinishSettingsAndValidate()
     End If
 End Sub
 
-Private Sub ValidateRetainedDimension(ByVal index As Long, ByVal styleRestored As Boolean)
+Private Sub ValidateRetainedDimension(ByVal index As Long)
     On Error GoTo Invalid
     Dim dd As SldWorks.DisplayDimension, ann As SldWorks.Annotation, value As SldWorks.Dimension
     Dim p As Variant, physical As Double, dangling As Boolean, overridden As Boolean
     Set dd = jobs(index).CreatedDD
     Set value = dd.GetDimension2(0)
-    If value Is Nothing Then Err.Raise vbObjectError + 110, , "New dimension readback unavailable after view restoration."
+    If value Is Nothing Then Err.Raise vbObjectError + 110, , "New dimension readback unavailable during final validation."
     Set ann = dd.GetAnnotation
-    If ann Is Nothing Then Err.Raise vbObjectError + 111, , "New annotation unavailable after view restoration."
+    If ann Is Nothing Then Err.Raise vbObjectError + 111, , "New annotation unavailable during final validation."
     p = ann.GetPosition
     RequirePosition p
     physical = value.SystemValue
     dangling = ApiBoolean(ann.IsDangling): overridden = ApiBoolean(dd.GetOverride)
-    LogLine "POST RESTORE body=[" & jobs(index).Body.Name & "]; actual mm=" & physical * 1000# & _
+    LogLine "FINAL VALIDATION body=[" & jobs(index).Body.Name & "]; actual mm=" & physical * 1000# & _
         "; expected mm=" & jobs(index).Expected * 1000# & "; dangling=" & dangling & "; override=" & overridden & _
         "; XY m=(" & p(0) & ", " & p(1) & ")"
-    If Abs(physical - jobs(index).Expected) > LENGTH_TOL_M Then Err.Raise vbObjectError + 112, , "True LENGTH changed after style restore."
-    If dangling Or overridden Then Err.Raise vbObjectError + 113, , "New dimension is dangling or overridden after style restore."
+    If Abs(physical - jobs(index).Expected) > LENGTH_TOL_M Then Err.Raise vbObjectError + 112, , "True LENGTH changed during final validation."
+    If dangling Or overridden Then Err.Raise vbObjectError + 113, , "New dimension is dangling or overridden during final validation."
     If Abs(p(0) - jobs(index).TargetX) > POSITION_TOL_M Or Abs(p(1) - jobs(index).TargetY) > POSITION_TOL_M Then _
-        Err.Raise vbObjectError + 114, , "New text position changed after style restore."
+        Err.Raise vbObjectError + 114, , "New text position changed during final validation."
     ' Do not collision-test against our OWN occupied rectangle after reservation.
     If p(0) - jobs(index).HalfWidth < SHEET_MARGIN_M Or p(0) + jobs(index).HalfWidth > sheetWidth - SHEET_MARGIN_M Or _
         p(1) - jobs(index).HalfHeight < SHEET_MARGIN_M Or p(1) + jobs(index).HalfHeight > sheetHeight - SHEET_MARGIN_M Then _
-        Err.Raise vbObjectError + 115, , "New text estimate is outside sheet after style restore."
-    If styleRestored Then
-        jobs(index).Reason = "True cut-list LENGTH, XY and non-dangling annotation verified after original view style restored."
-    Else
-        jobs(index).State = "failed"
-        jobs(index).Reason = "Dimension retained with verified current value/XY; ORIGINAL VIEW STYLE RESTORE FAILED, manual review required."
-    End If
+        Err.Raise vbObjectError + 115, , "New text estimate is outside sheet during final validation."
+    jobs(index).Reason = "True cut-list LENGTH, XY and non-dangling annotation verified; view style unchanged."
     Exit Sub
 Invalid:
     Dim reason As String
     reason = CStr(Err.Number) & ": " & Err.Description
     jobs(index).State = "failed": jobs(index).Reason = reason
-    LogLine "POST RESTORE invalid new dimension: " & reason
+    LogLine "FINAL VALIDATION invalid new dimension: " & reason
     If RemoveNewDimension(jobs(index).CreatedDD) = False Then
         blocked = True
         jobs(index).Reason = reason & "; CLEANUP FAILED; inspect current new dimension manually."
     Else
         Set jobs(index).CreatedDD = Nothing
     End If
+End Sub
+
+Private Sub DiscoverAdjacentSupportFaces(ByVal visible As SldWorks.Edge, ByVal edgeIndex As Long)
+    On Error GoTo Unavailable
+    Dim converted As Object, source As SldWorks.Edge, body As SldWorks.Body2
+    Dim faces As Variant, face As SldWorks.Face2, index As Long, i As Long, context As String
+    context = "visible edge index=" & edgeIndex
+    LogLine "BEGIN support edge reverse; " & context
+    Set converted = frameModel.Extension.GetCorrespondingEntity2(visible)
+    LogLine "DONE support edge reverse; " & context
+    If converted Is Nothing Then Exit Sub
+    If Not TypeOf converted Is SldWorks.Edge Then Exit Sub
+    Set source = converted
+    Set body = source.GetBody
+    If body Is Nothing Then Exit Sub
+    index = FindJobForBody(body)
+    If index = 0 Then Exit Sub
+    If jobs(index).State <> "pending" Or jobs(index).NormalCount <> 0 Then Exit Sub
+    context = "body=[" & jobs(index).Body.Name & "]; visible edge index=" & edgeIndex
+    LogLine "BEGIN support source edge adjacency; " & context
+    faces = source.GetTwoAdjacentFaces2
+    LogLine "DONE support source edge adjacency; " & context
+    If HasItems(faces) = False Then Exit Sub
+    For i = LBound(faces) To UBound(faces)
+        Set face = faces(i)
+        If Not face Is Nothing Then AcceptSupportFace face, context & "; adjacent face index=" & i
+    Next i
+    Exit Sub
+Unavailable:
+    LogLine "SOURCE FACE edge discovery rejected; " & context & ": " & Err.Number & ": " & Err.Description
 End Sub
