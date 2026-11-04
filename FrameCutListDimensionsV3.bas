@@ -12,7 +12,6 @@ Private Const SHEET_MARGIN_M As Double = 0.001
 Private Const MAX_EDGE_ATTEMPTS As Long = 8
 Private Const PROBE_STEP_M As Double = 0.001
 Private Const MAX_FULL_LENGTH_EDGES As Long = 256
-Private Const MAX_SOURCE_CANDIDATES As Long = 32
 Private Const SOURCE_BODY_BUDGET_S As Double = 30#
 Private Const SOURCE_TOTAL_BUDGET_S As Double = 120#
 Private Type BodyJob
@@ -24,6 +23,9 @@ Private Type BodyJob
     Visible As Collection
     Source As Collection
     FullLengthEdges As Collection
+    FullLengthGeometry As Collection
+    SourceNeedsMapping As Boolean
+    SourcePrepSeconds As Double
     Route As String
     NormalCount As Long
     Scores As Collection
@@ -57,6 +59,7 @@ Private ignoredExisting As Long, unresolvedExisting As Long, unknownExisting As 
 Private resultSummary As String, resultWarning As Boolean
 Private seedFace As SldWorks.Face2
 Private sourcePrepStarted As Double, sourceTotalTimedOut As Boolean
+Private sourcePrepElapsed As Double
 Private sourceCentre As Variant
 Private currentJob As Long
 
@@ -67,7 +70,7 @@ Public Sub main()
     Set frameInstance = Nothing: Set frameDrawingComponent = Nothing: Set selectedBody = Nothing
     Set seedFace = Nothing
     Set visited = New Collection: Set occupied = New Collection
-    sourcePrepStarted = 0#: sourceTotalTimedOut = False
+    sourcePrepStarted = 0#: sourceTotalTimedOut = False: sourcePrepElapsed = 0#
     Erase jobs
     jobCount = 0: currentJob = 0: preferenceCaptured = False
     blocked = False: queueComplete = False
@@ -132,7 +135,7 @@ Public Sub main()
             If blocked Then Exit For
             If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then
                 jobs(i).Route = "source-face boundary"
-                If jobs(i).Visible.Count > 0 Then
+                If jobs(i).Source.Count > 0 Then
                     EnsureInputPreference
                     ProcessBody i
                 Else
@@ -216,6 +219,7 @@ Private Sub QueueFolder(ByVal feature As SldWorks.Feature)
                 Set jobs(jobCount).Source = New Collection
                 Set jobs(jobCount).Scores = New Collection
                 Set jobs(jobCount).FullLengthEdges = New Collection
+                Set jobs(jobCount).FullLengthGeometry = New Collection
                 If lengthOK = False Then
                     jobs(jobCount).State = "skipped": jobs(jobCount).Reason = reason
                 Else
@@ -257,8 +261,9 @@ Private Sub ValidateLengthDirection(ByVal index As Long)
     On Error GoTo Unsupported
     Dim edges As Variant, edge As SldWorks.Edge, a As Variant, b As Variant, length As Double
     Dim i As Long, matches As Long, dx As Double, dy As Double, dz As Double, dot As Double
-    Dim prepared As Collection
+    Dim prepared As Collection, geometry As Collection
     Set prepared = New Collection
+    Set geometry = New Collection
     edges = jobs(index).Body.GetEdges
     If HasItems(edges) = False Then Err.Raise vbObjectError + 39, , "Body has no accessible edges."
     For i = LBound(edges) To UBound(edges)
@@ -275,16 +280,19 @@ Private Sub ValidateLengthDirection(ByVal index As Long)
                 If prepared.Count >= MAX_FULL_LENGTH_EDGES Then Err.Raise vbObjectError + 124, , _
                     "Full-LENGTH edge cache exceeds cap256; entire body skipped, partial cache discarded."
                 prepared.Add edge
+                geometry.Add Array(a, b, length)
                 matches = matches + 1
             End If
         End If
     Next i
     If matches = 0 Then Err.Raise vbObjectError + 41, , "Cut-list length is not represented by a straight source edge."
+    Set jobs(index).FullLengthGeometry = geometry
     Set jobs(index).FullLengthEdges = prepared
     LogLine "BODY preflight=[" & jobs(index).Body.Name & "]; length mm=" & jobs(index).Expected * 1000# & "; parallel full-length edges=" & matches
     Exit Sub
 Unsupported:
     Set jobs(index).FullLengthEdges = New Collection
+    Set jobs(index).FullLengthGeometry = New Collection
     jobs(index).State = "skipped"
     jobs(index).Reason = "Unsupported source geometry: " & Err.Description
 End Sub
@@ -366,6 +374,10 @@ End Function
 
 Private Sub ProcessBody(ByVal index As Long)
     currentJob = index
+    If jobs(index).SourceNeedsMapping Then
+        ProcessSourceBody index
+        Exit Sub
+    End If
     If jobs(index).Visible.Count = 0 Then
         jobs(index).State = "skipped"
         jobs(index).Reason = "No verified full-LENGTH candidate for this source cut-list body."
@@ -386,6 +398,65 @@ Private Sub ProcessBody(ByVal index As Long)
     jobs(index).State = "failed"
     jobs(index).Reason = reason
 End Sub
+
+Private Sub ProcessSourceBody(ByVal index As Long)
+    Set selectedBody = jobs(index).Body
+    expectedLength = jobs(index).Expected
+    Dim candidate As Long, attempts As Long, reason As String
+    Dim mapped As SldWorks.Edge, mapStarted As Double, mapSeconds As Double, mappingElapsed As Double
+    LogLine "BEGIN deferred source mapping; body=[" & selectedBody.Name & "]; candidates=" & jobs(index).Source.Count
+    For candidate = 1 To jobs(index).Source.Count
+        If attempts >= MAX_EDGE_ATTEMPTS Or blocked Then Exit For
+        If sourcePrepElapsed >= SOURCE_TOTAL_BUDGET_S Then
+            sourceTotalTimedOut = True
+            jobs(index).Reason = "Total source preparation budget reached before all cached edges were processed."
+            GoTo TimedOut
+        End If
+        If jobs(index).SourcePrepSeconds >= SOURCE_BODY_BUDGET_S Then
+            jobs(index).Reason = "Per-body source preparation budget reached; other bodies can continue."
+            GoTo TimedOut
+        End If
+        mapStarted = Timer
+        Set mapped = TryMapSourceBoundary(jobs(index).Source(candidate))
+        mapSeconds = ElapsedSeconds(mapStarted, Timer)
+        mappingElapsed = mappingElapsed + mapSeconds
+        jobs(index).SourcePrepSeconds = jobs(index).SourcePrepSeconds + mapSeconds
+        sourcePrepElapsed = sourcePrepElapsed + mapSeconds
+        If Not mapped Is Nothing Then
+            attempts = attempts + 1
+            LogLine "BODY attempt: [" & selectedBody.Name & "]; edge=" & attempts & "; length mm=" & expectedLength * 1000#
+            If TryCreateDimension(mapped, jobs(index).Source(candidate), reason) Then
+                jobs(index).State = "created"
+                jobs(index).Reason = "True length and final annotation position verified."
+                LogLine "DONE deferred source mapping; examined=" & candidate & "; mapped=" & attempts & "; mapping seconds=" & mappingElapsed
+                Exit Sub
+            End If
+        End If
+    Next candidate
+    LogLine "DONE deferred source mapping; mapped=" & attempts & "; mapping seconds=" & mappingElapsed
+    If attempts = 0 Then
+        jobs(index).State = "skipped"
+        jobs(index).Reason = "No usable plane/cylinder boundary among validated full-LENGTH source edges; visibility is not proven."
+    Else
+        jobs(index).State = "failed"
+        jobs(index).Reason = reason
+    End If
+    Exit Sub
+TimedOut:
+    jobs(index).State = "skipped"
+    ClearSourceCandidates index
+    LogLine "SOURCE mapping timeout body=[" & jobs(index).Body.Name & "]; preparation seconds=" & jobs(index).SourcePrepSeconds & _
+        "; total preparation seconds=" & sourcePrepElapsed & "; " & jobs(index).Reason
+    If sourceTotalTimedOut Then SkipUnpreparedSourceJobs index + 1
+End Sub
+
+Private Function TryMapSourceBoundary(ByVal source As SldWorks.Edge) As SldWorks.Edge
+    On Error GoTo Rejected
+    Set TryMapSourceBoundary = MapSourceBoundaryToView(source)
+    Exit Function
+Rejected:
+    LogLine "SOURCE boundary rejected: " & Err.Number & ": " & Err.Description
+End Function
 
 Private Function TryCreateDimension(ByVal visible As SldWorks.Edge, ByVal source As SldWorks.Edge, ByRef reason As String) As Boolean
     On Error GoTo Failed
@@ -1366,7 +1437,7 @@ Private Sub DiscoverSourceBoundaries()
     sourcePrepStarted = Timer
     sourceTotalTimedOut = False
     LogLine "SOURCE PREPARATION cached full-LENGTH edges; cache cap=" & MAX_FULL_LENGTH_EDGES & _
-        "; retained/body=" & MAX_SOURCE_CANDIDATES & "; seconds/body=" & SOURCE_BODY_BUDGET_S & _
+        "; mapping deferred until attempts; seconds/body=" & SOURCE_BODY_BUDGET_S & _
         "; total seconds=" & SOURCE_TOTAL_BUDGET_S & "; visibility NOT proven"
     Dim i As Long
     For i = 1 To jobCount
@@ -1374,16 +1445,19 @@ Private Sub DiscoverSourceBoundaries()
             If ElapsedSeconds(sourcePrepStarted, Timer) >= SOURCE_TOTAL_BUDGET_S Then
                 sourceTotalTimedOut = True
                 SkipUnpreparedSourceJobs i
+                sourcePrepElapsed = ElapsedSeconds(sourcePrepStarted, Timer)
                 Exit Sub
             End If
             PrepareSourceBody i
             If sourceTotalTimedOut Then
                 SkipUnpreparedSourceJobs i + 1
+                sourcePrepElapsed = ElapsedSeconds(sourcePrepStarted, Timer)
                 Exit Sub
             End If
         End If
     Next i
-    LogLine "SOURCE PREPARATION completed; total elapsed seconds=" & ElapsedSeconds(sourcePrepStarted, Timer)
+    sourcePrepElapsed = ElapsedSeconds(sourcePrepStarted, Timer)
+    LogLine "SOURCE PREPARATION completed; total elapsed seconds=" & sourcePrepElapsed & "; mapping deferred"
 End Sub
 
 
@@ -1391,10 +1465,10 @@ End Sub
 
 
 Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks.Edge, _
-        ByRef centre As Variant, ByRef centreReady As Boolean) As Boolean
+        ByVal geometry As Variant, ByRef centre As Variant, ByRef centreReady As Boolean) As Boolean
     On Error GoTo Rejected
     Dim body As SldWorks.Body2, a As Variant, b As Variant, length As Double
-    Dim mapped As SldWorks.Edge, i As Long, prior As SldWorks.Edge, score As Double, insertAt As Long
+    Dim i As Long, prior As SldWorks.Edge, score As Double, insertAt As Long
     Dim box As Variant, pa As Variant, pb As Variant, dx As Double, dy As Double
     Set body = source.GetBody
     If body Is Nothing Then Exit Function
@@ -1406,8 +1480,7 @@ Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks
         Set prior = jobs(index).Source(i)
         If app.IsSame(prior, source) = swObjectSame Then Exit Function
     Next i
-    If StraightGeometry(source, a, b, length) = False Then Exit Function
-    If Abs(length - jobs(index).Expected) > LENGTH_TOL_M Then Exit Function
+    a = geometry(0): b = geometry(1): length = geometry(2)
     If PlaneCylinderBoundary(source) = False Then Exit Function
     pa = ProjectPoint(a): pb = ProjectPoint(b)
     dx = pb(0) - pa(0): dy = pb(1) - pa(1)
@@ -1421,8 +1494,6 @@ Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks
     End If
     sourceCentre = centre
     score = RadialScore(a, b, length)
-    Set mapped = MapSourceBoundaryToView(source)
-    If mapped Is Nothing Then Exit Function
     For i = 1 To jobs(index).Scores.Count
         If score > CDbl(jobs(index).Scores(i)) Then
             insertAt = i
@@ -1431,19 +1502,12 @@ Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks
     Next i
     If insertAt > 0 Then
         jobs(index).Source.Add source, , insertAt
-        jobs(index).Visible.Add mapped, , insertAt
         jobs(index).Scores.Add score, , insertAt
     Else
         jobs(index).Source.Add source
-        jobs(index).Visible.Add mapped
         jobs(index).Scores.Add score
     End If
-    ' Collections remain aligned after descending-score insertion and trimming.
-    If jobs(index).Source.Count > MAX_SOURCE_CANDIDATES Then
-        jobs(index).Source.Remove jobs(index).Source.Count
-        jobs(index).Visible.Remove jobs(index).Visible.Count
-        jobs(index).Scores.Remove jobs(index).Scores.Count
-    End If
+    ' Keep all preflight-capped candidates in stable score order until mapping.
     AddSourceBoundary = True
     Exit Function
 Rejected:
@@ -1505,6 +1569,7 @@ Private Sub PrepareSourceBody(ByVal index As Long)
     On Error GoTo Unsupported
     Dim bodyStarted As Double, i As Long, source As SldWorks.Edge, accepted As Long
     Dim centre As Variant, centreReady As Boolean
+    jobs(index).SourceNeedsMapping = True
     bodyStarted = Timer
     LogLine "BEGIN cached source preparation; body=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
         "; cached edges=" & jobs(index).FullLengthEdges.Count
@@ -1522,19 +1587,22 @@ Private Sub PrepareSourceBody(ByVal index As Long)
             GoTo TimedOut
         End If
         Set source = jobs(index).FullLengthEdges(i)
-        If AddSourceBoundary(index, source, centre, centreReady) Then accepted = accepted + 1
+        If AddSourceBoundary(index, source, jobs(index).FullLengthGeometry(i), centre, centreReady) Then accepted = accepted + 1
     Next i
+    jobs(index).SourcePrepSeconds = ElapsedSeconds(bodyStarted, Timer)
     LogLine "DONE cached source preparation; body=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
         "; elapsed seconds=" & ElapsedSeconds(bodyStarted, Timer) & "; accepted boundaries=" & accepted & _
         "; retained=" & jobs(index).Source.Count & "; complete=True; visibility NOT proven"
     Exit Sub
 TimedOut:
+    jobs(index).SourcePrepSeconds = ElapsedSeconds(bodyStarted, Timer)
     jobs(index).State = "skipped"
     ClearSourceCandidates index
     LogLine "SOURCE body timeout=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
         "; elapsed seconds=" & ElapsedSeconds(bodyStarted, Timer) & "; " & jobs(index).Reason
     Exit Sub
 Unsupported:
+    jobs(index).SourcePrepSeconds = ElapsedSeconds(bodyStarted, Timer)
     jobs(index).State = "skipped"
     jobs(index).Reason = "Cached source preparation unsupported: " & Err.Description
     ClearSourceCandidates index
@@ -1555,6 +1623,7 @@ Private Sub SkipUnpreparedSourceJobs(ByVal first As Long)
 End Sub
 
 Private Sub ClearSourceCandidates(ByVal index As Long)
+    jobs(index).SourceNeedsMapping = False
     Set jobs(index).Source = New Collection
     Set jobs(index).Visible = New Collection
     Set jobs(index).Scores = New Collection
