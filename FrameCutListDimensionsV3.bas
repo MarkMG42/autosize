@@ -349,6 +349,7 @@ Private Function AddVisibleCandidate(ByVal visible As SldWorks.Edge) As Boolean
     If Not TypeOf converted Is SldWorks.Edge Then Exit Function
     Set source = converted
     If StraightGeometry(source, a, b, length) = False Then Exit Function
+    If AnyExpectedLength(length) = False Then Exit Function
     Set body = source.GetBody
     If body Is Nothing Then Exit Function
     index = FindJobForBody(body)
