@@ -1,19 +1,20 @@
-Attribute VB_Name = "FrameCutListDimensionsV2"
+Attribute VB_Name = "FrameCutListDimensionsV3"
 Option Explicit
 
 ' Bulk true lengths for cut-list bodies of ONE explicitly selected frame part.
 ' No other assembly components are dimensioned. No model saves/rebuilds,
 ' configuration switches or text/value overrides. Standard SldWorks/SwConst only.
-Private Const PREFIX As String = "FrameCutListDimensionsV2 v2.2"
+Private Const PREFIX As String = "FrameCutListDimensionsV3 v3.0"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
 Private Const SHEET_MARGIN_M As Double = 0.001
 Private Const MAX_EDGE_ATTEMPTS As Long = 8
 Private Const PROBE_STEP_M As Double = 0.001
-Private Const MAX_SOURCE_FACES As Long = 2000
+Private Const MAX_FULL_LENGTH_EDGES As Long = 256
 Private Const MAX_SOURCE_CANDIDATES As Long = 32
-Private Const SOURCE_PREP_BUDGET_S As Double = 30#
+Private Const SOURCE_BODY_BUDGET_S As Double = 30#
+Private Const SOURCE_TOTAL_BUDGET_S As Double = 120#
 Private Type BodyJob
     Body As SldWorks.Body2
     FolderName As String
@@ -22,6 +23,7 @@ Private Type BodyJob
     Reason As String
     Visible As Collection
     Source As Collection
+    FullLengthEdges As Collection
     Route As String
     NormalCount As Long
     Scores As Collection
@@ -53,8 +55,8 @@ Private sheetA As Variant, sheetB As Variant, sheetCentre As Variant
 Private blocked As Boolean, queueComplete As Boolean
 Private ignoredExisting As Long, unresolvedExisting As Long, unknownExisting As Long
 Private resultSummary As String, resultWarning As Boolean
-Private seedFace As SldWorks.Face2, supportFace As SldWorks.Face2
-Private sourcePrepStarted As Double, sourcePrepTimedOut As Boolean
+Private seedFace As SldWorks.Face2
+Private sourcePrepStarted As Double, sourceTotalTimedOut As Boolean
 Private sourceCentre As Variant
 Private currentJob As Long
 
@@ -63,9 +65,9 @@ Public Sub main()
     CloseLog
     Set drawing = Nothing: Set view = Nothing: Set frameModel = Nothing
     Set frameInstance = Nothing: Set frameDrawingComponent = Nothing: Set selectedBody = Nothing
-    Set seedFace = Nothing: Set supportFace = Nothing
+    Set seedFace = Nothing
     Set visited = New Collection: Set occupied = New Collection
-    sourcePrepStarted = 0#: sourcePrepTimedOut = False
+    sourcePrepStarted = 0#: sourceTotalTimedOut = False
     Erase jobs
     jobCount = 0: currentJob = 0: preferenceCaptured = False
     blocked = False: queueComplete = False
@@ -115,7 +117,7 @@ Public Sub main()
         If jobs(i).NormalCount > 0 Then jobs(i).Route = "normal visible edge"
     Next i
     InspectExistingDimensions
-    If blocked = False And NeedSupportPhase Then DiscoverSupportFaces
+    If blocked = False And NeedSupportPhase Then DiscoverSourceBoundaries
     LogLine "PHASE 1: normal visible-edge candidates, original view style"
     For i = 1 To jobCount
         If blocked Then Exit For
@@ -135,7 +137,7 @@ Public Sub main()
                     ProcessBody i
                 Else
                     jobs(i).State = "skipped"
-                    jobs(i).Reason = "No usable full-LENGTH plane/cylinder boundary in this source cut-list body; visibility is not proven."
+                    jobs(i).Reason = "No usable plane/cylinder boundary among validated full-LENGTH source edges; visibility is not proven."
                 End If
             End If
         Next i
@@ -213,6 +215,7 @@ Private Sub QueueFolder(ByVal feature As SldWorks.Feature)
                 Set jobs(jobCount).Visible = New Collection
                 Set jobs(jobCount).Source = New Collection
                 Set jobs(jobCount).Scores = New Collection
+                Set jobs(jobCount).FullLengthEdges = New Collection
                 If lengthOK = False Then
                     jobs(jobCount).State = "skipped": jobs(jobCount).Reason = reason
                 Else
@@ -254,6 +257,8 @@ Private Sub ValidateLengthDirection(ByVal index As Long)
     On Error GoTo Unsupported
     Dim edges As Variant, edge As SldWorks.Edge, a As Variant, b As Variant, length As Double
     Dim i As Long, matches As Long, dx As Double, dy As Double, dz As Double, dot As Double
+    Dim prepared As Collection
+    Set prepared = New Collection
     edges = jobs(index).Body.GetEdges
     If HasItems(edges) = False Then Err.Raise vbObjectError + 39, , "Body has no accessible edges."
     For i = LBound(edges) To UBound(edges)
@@ -267,14 +272,19 @@ Private Sub ValidateLengthDirection(ByVal index As Long)
                     dot = dx * jobs(index).AxisX + dy * jobs(index).AxisY + dz * jobs(index).AxisZ
                     If Abs(dot) < 0.999999 Then Err.Raise vbObjectError + 40, , "Ambiguous length direction: full-LENGTH edges are not parallel."
                 End If
+                If prepared.Count >= MAX_FULL_LENGTH_EDGES Then Err.Raise vbObjectError + 124, , _
+                    "Full-LENGTH edge cache exceeds cap256; entire body skipped, partial cache discarded."
+                prepared.Add edge
                 matches = matches + 1
             End If
         End If
     Next i
     If matches = 0 Then Err.Raise vbObjectError + 41, , "Cut-list length is not represented by a straight source edge."
+    Set jobs(index).FullLengthEdges = prepared
     LogLine "BODY preflight=[" & jobs(index).Body.Name & "]; length mm=" & jobs(index).Expected * 1000# & "; parallel full-length edges=" & matches
     Exit Sub
 Unsupported:
+    Set jobs(index).FullLengthEdges = New Collection
     jobs(index).State = "skipped"
     jobs(index).Reason = "Unsupported source geometry: " & Err.Description
 End Sub
@@ -1056,7 +1066,7 @@ Private Sub OpenLog()
     Dim fs As Object, stream As Object
     logAvailable = False
     Set fs = CreateObject("Scripting.FileSystemObject")
-    outputPath = fs.BuildPath(fs.GetSpecialFolder(2), "FrameCutListDimensionsV2-" & fs.GetTempName & ".txt")
+    outputPath = fs.BuildPath(fs.GetSpecialFolder(2), "FrameCutListDimensionsV3-" & fs.GetTempName & ".txt")
     Set stream = fs.CreateTextFile(outputPath, False, True)
     stream.Close
     logAvailable = True
@@ -1297,20 +1307,6 @@ Private Function PlaneCylinderBoundary(ByVal edge As SldWorks.Edge) As Boolean
     PlaneCylinderBoundary = ((plane1 And cylinder2) Or (plane2 And cylinder1))
 End Function
 
-Private Function EdgeHasSupportFace(ByVal edge As SldWorks.Edge) As Boolean
-    Dim faces As Variant, face As SldWorks.Face2, i As Long
-    faces = edge.GetTwoAdjacentFaces2
-    If HasItems(faces) = False Then Exit Function
-    For i = LBound(faces) To UBound(faces)
-        Set face = faces(i)
-        If Not face Is Nothing Then
-            If app.IsSame(face, supportFace) = swObjectSame Then
-                EdgeHasSupportFace = True
-                Exit Function
-            End If
-        End If
-    Next i
-End Function
 
 Private Function RadialScore(ByVal a As Variant, ByVal b As Variant, ByVal length As Double) As Double
     ' Heuristic only: outer boundaries usually lie farther from body-box centre
@@ -1346,55 +1342,47 @@ Private Function NeedSupportPhase() As Boolean
     Next i
 End Function
 
-Private Sub DiscoverSupportFaces()
-    ' SOURCE ONLY. No drawing-edge reverse mapping or visibility queries here.
-    ' Every face is obtained directly from its queued source cut-list body.
+Private Sub DiscoverSourceBoundaries()
+    ' Use only the fully validated source edges cached during the existing
+    ' Body.GetEdges preflight. No drawing reverse, body-face scans or face scans.
     sourcePrepStarted = Timer
-    sourcePrepTimedOut = False
-    LogLine "SOURCE PREPARATION source cut-list geometry only; face cap=" & MAX_SOURCE_FACES & _
-        "; retained candidates/body=" & MAX_SOURCE_CANDIDATES & "; budget seconds=" & SOURCE_PREP_BUDGET_S & "; visibility NOT proven"
+    sourceTotalTimedOut = False
+    LogLine "SOURCE PREPARATION cached full-LENGTH edges; cache cap=" & MAX_FULL_LENGTH_EDGES & _
+        "; retained/body=" & MAX_SOURCE_CANDIDATES & "; seconds/body=" & SOURCE_BODY_BUDGET_S & _
+        "; total seconds=" & SOURCE_TOTAL_BUDGET_S & "; visibility NOT proven"
     Dim i As Long
     For i = 1 To jobCount
         If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then
-            If SourcePrepBudgetExceeded Then
+            If ElapsedSeconds(sourcePrepStarted, Timer) >= SOURCE_TOTAL_BUDGET_S Then
+                sourceTotalTimedOut = True
                 SkipUnpreparedSourceJobs i
                 Exit Sub
             End If
             PrepareSourceBody i
-            If sourcePrepTimedOut Then
-                SkipUnpreparedSourceJobs i
+            If sourceTotalTimedOut Then
+                SkipUnpreparedSourceJobs i + 1
                 Exit Sub
             End If
         End If
     Next i
-    LogLine "SOURCE PREPARATION completed within budget"
+    LogLine "SOURCE PREPARATION completed; total elapsed seconds=" & ElapsedSeconds(sourcePrepStarted, Timer)
 End Sub
 
 
 
 
-Private Sub CollectFaceEdges(ByVal index As Long, ByVal face As SldWorks.Face2, ByVal faceIndex As Long)
-    Dim edges As Variant, i As Long, source As SldWorks.Edge, accepted As Long
-    edges = face.GetEdges
-    If HasItems(edges) = False Then Exit Sub
-    For i = LBound(edges) To UBound(edges)
-        If SourcePrepBudgetExceeded Then Exit Sub
-        Set source = edges(i)
-        If AddFaceEdge(index, source) Then accepted = accepted + 1
-    Next i
-    If SourcePrepBudgetExceeded Then Exit Sub
-    LogLine "SOURCE cylinder face body=[" & jobs(index).Body.Name & "]; face index=" & faceIndex & _
-        "; real edges=" & (UBound(edges) - LBound(edges) + 1) & "; accepted boundaries=" & accepted & "; retained=" & jobs(index).Source.Count
-End Sub
 
-Private Function AddFaceEdge(ByVal index As Long, ByVal source As SldWorks.Edge) As Boolean
+Private Function AddSourceBoundary(ByVal index As Long, ByVal source As SldWorks.Edge) As Boolean
     On Error GoTo Rejected
     Dim body As SldWorks.Body2, a As Variant, b As Variant, length As Double
     Dim mapped As SldWorks.Edge, i As Long, prior As SldWorks.Edge, score As Double, insertAt As Long
     Dim box As Variant, pa As Variant, pb As Variant, dx As Double, dy As Double
     Set body = source.GetBody
     If body Is Nothing Then Exit Function
-    If FindJobForBody(body) <> index Then Exit Function
+    If app.IsSame(body, jobs(index).Body) <> swObjectSame Then _
+        Err.Raise vbObjectError + 126, , "Cached source edge body identity differs from its job."
+    If StrComp(body.Name, jobs(index).Body.Name, vbBinaryCompare) <> 0 Then _
+        Err.Raise vbObjectError + 127, , "Identical cached source body returned inconsistent names."
     For i = 1 To jobs(index).Source.Count
         Set prior = jobs(index).Source(i)
         If app.IsSame(prior, source) = swObjectSame Then Exit Function
@@ -1402,7 +1390,6 @@ Private Function AddFaceEdge(ByVal index As Long, ByVal source As SldWorks.Edge)
     If StraightGeometry(source, a, b, length) = False Then Exit Function
     If Abs(length - jobs(index).Expected) > LENGTH_TOL_M Then Exit Function
     If PlaneCylinderBoundary(source) = False Then Exit Function
-    If EdgeHasSupportFace(source) = False Then Exit Function
     pa = ProjectPoint(a): pb = ProjectPoint(b)
     dx = pb(0) - pa(0): dy = pb(1) - pa(1)
     If Sqr(dx * dx + dy * dy) < 0.00001 Then Exit Function
@@ -1434,10 +1421,10 @@ Private Function AddFaceEdge(ByVal index As Long, ByVal source As SldWorks.Edge)
         jobs(index).Visible.Remove jobs(index).Visible.Count
         jobs(index).Scores.Remove jobs(index).Scores.Count
     End If
-    AddFaceEdge = True
+    AddSourceBoundary = True
     Exit Function
 Rejected:
-    LogLine "SOURCE FACE edge rejected: " & Err.Number & ": " & Err.Description
+    LogLine "SOURCE boundary rejected: " & Err.Number & ": " & Err.Description
 End Function
 
 Private Sub FinishAndValidate()
@@ -1493,67 +1480,43 @@ End Sub
 
 Private Sub PrepareSourceBody(ByVal index As Long)
     On Error GoTo Unsupported
-    Dim faces As Variant, face As SldWorks.Face2, owner As SldWorks.Body2
-    Dim surface As SldWorks.Surface, seen As Collection, previous As SldWorks.Face2
-    Dim i As Long, j As Long, count As Long, duplicate As Boolean, cylinders As Long
-    Set seen = New Collection
-    LogLine "BEGIN source Body.GetFaces; body=[" & jobs(index).Body.Name & "]"
-    faces = jobs(index).Body.GetFaces
-    If HasItems(faces) Then count = UBound(faces) - LBound(faces) + 1
-    LogLine "DONE source Body.GetFaces; body=[" & jobs(index).Body.Name & "]; faces=" & count
-    If count = 0 Then Err.Raise vbObjectError + 120, , "Source body has no accessible faces."
-    If count > MAX_SOURCE_FACES Then Err.Raise vbObjectError + 121, , "Source body exceeds the face cap; entire body skipped."
-    For i = LBound(faces) To UBound(faces)
-        If SourcePrepBudgetExceeded Then Exit Sub
-        Set face = faces(i)
-        If Not face Is Nothing Then
-            duplicate = False
-            For j = 1 To seen.Count
-                If SourcePrepBudgetExceeded Then Exit Sub
-                Set previous = seen(j)
-                If app.IsSame(previous, face) = swObjectSame Then
-                    duplicate = True
-                    Exit For
-                End If
-            Next j
-            If duplicate = False Then
-                seen.Add face
-                Set owner = face.GetBody
-                If owner Is Nothing Then Err.Raise vbObjectError + 122, , "Source face body unavailable."
-                If FindJobForBody(owner) <> index Then Err.Raise vbObjectError + 123, , "Source face is not owned by its queued body."
-                Set surface = face.GetSurface
-                If Not surface Is Nothing Then
-                    If ApiBoolean(surface.IsCylinder) Then
-                        cylinders = cylinders + 1
-                        Set supportFace = face
-                        CollectFaceEdges index, face, i
-                        If sourcePrepTimedOut Then Exit Sub
-                    End If
-                End If
-            End If
+    Dim bodyStarted As Double, i As Long, source As SldWorks.Edge, accepted As Long
+    bodyStarted = Timer
+    LogLine "BEGIN cached source preparation; body=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
+        "; cached edges=" & jobs(index).FullLengthEdges.Count
+    If jobs(index).FullLengthEdges.Count = 0 Then Err.Raise vbObjectError + 125, , "Validated full-LENGTH source edge cache is empty."
+    For i = 1 To jobs(index).FullLengthEdges.Count
+        ' Check cooperatively BEFORE another native call. A completed body's
+        ' valid candidates are never discarded by a later global time check.
+        If ElapsedSeconds(sourcePrepStarted, Timer) >= SOURCE_TOTAL_BUDGET_S Then
+            sourceTotalTimedOut = True
+            jobs(index).Reason = "Total source preparation budget reached before all cached edges were processed."
+            GoTo TimedOut
         End If
+        If ElapsedSeconds(bodyStarted, Timer) >= SOURCE_BODY_BUDGET_S Then
+            jobs(index).Reason = "Per-body source preparation budget reached; other bodies can continue."
+            GoTo TimedOut
+        End If
+        Set source = jobs(index).FullLengthEdges(i)
+        If AddSourceBoundary(index, source) Then accepted = accepted + 1
     Next i
-    If SourcePrepBudgetExceeded Then Exit Sub
-    LogLine "SOURCE body prepared=[" & jobs(index).Body.Name & "]; unique faces=" & seen.Count & _
-        "; cylinder faces=" & cylinders & "; retained ranked candidates=" & jobs(index).Source.Count & "; visibility NOT proven"
+    LogLine "DONE cached source preparation; body=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
+        "; elapsed seconds=" & ElapsedSeconds(bodyStarted, Timer) & "; accepted boundaries=" & accepted & _
+        "; retained=" & jobs(index).Source.Count & "; complete=True; visibility NOT proven"
+    Exit Sub
+TimedOut:
+    jobs(index).State = "skipped"
+    ClearSourceCandidates index
+    LogLine "SOURCE body timeout=[" & jobs(index).Body.Name & "]; timestamp=" & CStr(Now) & _
+        "; elapsed seconds=" & ElapsedSeconds(bodyStarted, Timer) & "; " & jobs(index).Reason
     Exit Sub
 Unsupported:
     jobs(index).State = "skipped"
-    jobs(index).Reason = "Source-only tube preparation unsupported: " & Err.Description
+    jobs(index).Reason = "Cached source preparation unsupported: " & Err.Description
     ClearSourceCandidates index
-    LogLine "SOURCE body skipped=[" & jobs(index).Body.Name & "]; " & jobs(index).Reason
+    LogLine "SOURCE body skipped=[" & jobs(index).Body.Name & "]; elapsed seconds=" & ElapsedSeconds(bodyStarted, Timer) & "; " & jobs(index).Reason
 End Sub
 
-Private Function SourcePrepBudgetExceeded() As Boolean
-    Dim elapsed As Double
-    elapsed = Timer - sourcePrepStarted
-    If elapsed < 0# Then elapsed = elapsed + 86400#
-    If elapsed >= SOURCE_PREP_BUDGET_S Then
-        If sourcePrepTimedOut = False Then LogLine "SOURCE PREPARATION budget reached; elapsed seconds=" & elapsed
-        sourcePrepTimedOut = True
-    End If
-    SourcePrepBudgetExceeded = sourcePrepTimedOut
-End Function
 
 Private Sub SkipUnpreparedSourceJobs(ByVal first As Long)
     Dim i As Long
@@ -1561,8 +1524,8 @@ Private Sub SkipUnpreparedSourceJobs(ByVal first As Long)
         If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then
             ClearSourceCandidates i
             jobs(i).State = "skipped"
-            jobs(i).Reason = "Source preparation time budget reached; partial candidates discarded, no legacy discovery fallback."
-            LogLine "SOURCE budget skip body=[" & jobs(i).Body.Name & "]"
+            jobs(i).Reason = "Total cached-source preparation budget reached before this body; previously completed bodies retained."
+            LogLine "SOURCE total-budget skip body=[" & jobs(i).Body.Name & "]; timestamp=" & CStr(Now)
         End If
     Next i
 End Sub
@@ -1572,3 +1535,10 @@ Private Sub ClearSourceCandidates(ByVal index As Long)
     Set jobs(index).Visible = New Collection
     Set jobs(index).Scores = New Collection
 End Sub
+
+Private Function ElapsedSeconds(ByVal started As Double, ByVal current As Double) As Double
+    Dim elapsed As Double
+    elapsed = current - started
+    If elapsed < 0# Then elapsed = elapsed + 86400#
+    ElapsedSeconds = elapsed
+End Function
