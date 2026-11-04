@@ -5,7 +5,7 @@ Option Explicit
 ' body; the macro finds a visible full-length plane/cylinder boundary after
 ' temporarily showing tangent edges. Original view mode/settings are restored.
 ' Standard SldWorks/SwConst only. No rebuild, model edit, override or save.
-Private Const PREFIX As String = "FrameTubeDimensionTrial v1.1"
+Private Const PREFIX As String = "FrameTubeDimensionTrial v1.2"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -82,7 +82,18 @@ Public Sub main()
         Err.Raise vbObjectError + 93, , "Unsupported tube selection object."
     End If
     Set converted = frameModel.Extension.GetCorrespondingEntity2(seed)
-    If converted Is Nothing Then Err.Raise vbObjectError + 31, , "Selected seed has no source-part correspondence."
+    If converted Is Nothing Then
+        If silhouetteSeed Then
+            ' Only the seed may already be part-context. Do not use name or
+            ' geometry guesses: its body must have exactly one native identity
+            ' match in the active, configuration-checked target part.
+            If FaceBodyIsInTargetPart(identifyingFace) Then
+                Set converted = identifyingFace
+                LogLine "SILHOUETTE reverse returned Nothing; supporting face body verified in target part"
+            End If
+        End If
+    End If
+    If converted Is Nothing Then Err.Raise vbObjectError + 31, , "Selected seed has no verified source-part correspondence."
     If silhouetteSeed Then
         If Not TypeOf converted Is SldWorks.Face2 Then Err.Raise vbObjectError + 32, , "Silhouette face did not map to a source Face2."
         Set identifyingFace = converted
@@ -531,6 +542,27 @@ Private Function FindPosition(ByVal halfWidth As Double, ByVal halfHeight As Dou
     Next level
 End Function
 
+Private Function FaceBodyIsInTargetPart(ByVal face As SldWorks.Face2) As Boolean
+    Dim body As SldWorks.Body2, candidate As SldWorks.Body2, part As SldWorks.PartDoc
+    Dim bodies As Variant, i As Long, matches As Long
+    If face Is Nothing Then Exit Function
+    If frameModel Is Nothing Then Exit Function
+    If frameModel.GetType <> swDocPART Then Exit Function
+    Set body = face.GetBody
+    If body Is Nothing Then Exit Function
+    Set part = frameModel
+    bodies = part.GetBodies2(swSolidBody, False)
+    If HasItems(bodies) = False Then Exit Function
+    For i = LBound(bodies) To UBound(bodies)
+        Set candidate = bodies(i)
+        If Not candidate Is Nothing Then
+            If app.IsSame(body, candidate) = swObjectSame Then matches = matches + 1
+        End If
+    Next i
+    LogLine "SILHOUETTE local-face body identity matches in target part=" & matches
+    FaceBodyIsInTargetPart = (matches = 1)
+End Function
+
 Private Sub ResolveSilhouetteContext(ByVal face As SldWorks.Face2, _
         ByVal sm As SldWorks.SelectionMgr, ByVal selectedIndex As Long)
     If face Is Nothing Then Err.Raise vbObjectError + 92, , "Silhouette supporting face unavailable."
@@ -545,18 +577,41 @@ Private Sub ResolveSilhouetteContext(ByVal face As SldWorks.Face2, _
         ' several identical instances was picked. Use the actual selection index.
         Set rawComponent = sm.GetSelectedObjectsComponent4(selectedIndex, -1)
         If rawComponent Is Nothing Then Err.Raise vbObjectError + 94, , "Selected silhouette component unavailable; choose an ordinary tube end edge."
-        If Not TypeOf rawComponent Is SldWorks.Component2 Then _
-            Err.Raise vbObjectError + 95, , "Silhouette selection did not identify a Component2."
-        Set component = rawComponent
+        Dim selectedWrapper As SldWorks.DrawingComponent, wrapperView As SldWorks.View
+        LogLine "SILHOUETTE component result type=" & TypeName(rawComponent) & _
+            "; supports Component2=" & (TypeOf rawComponent Is SldWorks.Component2) & _
+            "; supports DrawingComponent=" & (TypeOf rawComponent Is SldWorks.DrawingComponent)
+        If TypeOf rawComponent Is SldWorks.DrawingComponent Then
+            Set selectedWrapper = rawComponent
+            Set wrapperView = selectedWrapper.View
+            If wrapperView Is Nothing Then Err.Raise vbObjectError + 97, , "Selected DrawingComponent has no view."
+            If StrComp(wrapperView.GetName2, view.GetName2, vbBinaryCompare) <> 0 Then _
+                Err.Raise vbObjectError + 98, , "Selected DrawingComponent belongs to a different view."
+            Set component = selectedWrapper.Component
+            If component Is Nothing Then Err.Raise vbObjectError + 99, , "Selected DrawingComponent has no model Component2."
+            LogLine "SILHOUETTE unwrapped DrawingComponent in view=[" & wrapperView.GetName2 & "]"
+        ElseIf TypeOf rawComponent Is SldWorks.Component2 Then
+            Set component = rawComponent
+        Else
+            Err.Raise vbObjectError + 95, , "Silhouette owner is neither Component2 nor DrawingComponent."
+        End If
         LogLine "SILHOUETTE selected component=[" & component.Name2 & "]; index=" & selectedIndex
         Set frameInstance = ResolveFrameInstance(reference, component)
         Set frameModel = frameInstance.GetModelDoc2
         If frameModel Is Nothing Then Err.Raise vbObjectError + 9, , "Resolve/open the selected frame part first."
         CheckConfiguration frameModel, frameInstance.ReferencedConfiguration
-        Set dc = frameInstance.GetDrawingComponent(view)
+        If selectedWrapper Is Nothing Then
+            Set dc = frameInstance.GetDrawingComponent(view)
+        Else
+            Set dc = selectedWrapper
+        End If
         If dc Is Nothing Then Err.Raise vbObjectError + 96, , "Selected frame instance has no drawing component in this view."
         Set frameDrawingComponent = dc.Component
         If frameDrawingComponent Is Nothing Then Err.Raise vbObjectError + 8, , "Selected frame drawing component unavailable."
+        Dim verifiedOwner As SldWorks.Component2
+        Set verifiedOwner = ResolveFrameInstance(reference, frameDrawingComponent)
+        If app.IsSame(verifiedOwner, frameInstance) <> swObjectSame Then _
+            Err.Raise vbObjectError + 100, , "Drawing wrapper resolved to a different frame instance."
         LogLine "FRAME INSTANCE=[" & frameInstance.Name2 & "]; config=[" & frameInstance.ReferencedConfiguration & "]"
     ElseIf reference.GetType = swDocPART Then
         Set frameModel = reference
