@@ -9,6 +9,7 @@ Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
 Private Const SHEET_MARGIN_M As Double = 0.001
+Private Const BODY_TEXT_GAP_M As Double = 0.005
 Private Const MAX_EDGE_ATTEMPTS As Long = 8
 Private Const PROBE_STEP_M As Double = 0.001
 Private Const MAX_FULL_LENGTH_EDGES As Long = 256
@@ -34,6 +35,10 @@ Private Type BodyJob
     TargetY As Double
     HalfWidth As Double
     HalfHeight As Double
+    PlacementNX As Double
+    PlacementNY As Double
+    BodySupportMin As Double
+    BodySupportMax As Double
     AxisX As Double
     AxisY As Double
     AxisZ As Double
@@ -53,7 +58,10 @@ Private logAvailable As Boolean
 Private outputPath As String
 Private preferenceCaptured As Boolean, oldInputPreference As Boolean
 Private sheetWidth As Double, sheetHeight As Double
-Private sheetA As Variant, sheetB As Variant, sheetCentre As Variant
+Private sheetA As Variant, sheetB As Variant
+Private placementReady As Boolean
+Private placementNX As Double, placementNY As Double
+Private bodySupportMin As Double, bodySupportMax As Double
 Private blocked As Boolean, queueComplete As Boolean
 Private ignoredExisting As Long, unresolvedExisting As Long, unknownExisting As Long
 Private resultSummary As String, resultWarning As Boolean
@@ -71,6 +79,7 @@ Public Sub main()
     Set seedFace = Nothing
     Set visited = New Collection: Set occupied = New Collection
     sourcePrepStarted = 0#: sourceTotalTimedOut = False: sourcePrepElapsed = 0#
+    placementReady = False
     Erase jobs
     jobCount = 0: currentJob = 0: preferenceCaptured = False
     blocked = False: queueComplete = False
@@ -460,15 +469,13 @@ End Function
 
 Private Function TryCreateDimension(ByVal visible As SldWorks.Edge, ByVal source As SldWorks.Edge, ByRef reason As String) As Boolean
     On Error GoTo Failed
+    placementReady = False
     Dim dd As SldWorks.DisplayDimension, attempted As Boolean
-    Dim a As Variant, b As Variant, length As Double, box As Variant, centre As Variant
+    Dim a As Variant, b As Variant, length As Double
     If StraightGeometry(source, a, b, length) = False Then Err.Raise vbObjectError + 45, , "Source candidate no longer straight."
     If Abs(length - expectedLength) > LENGTH_TOL_M Then Err.Raise vbObjectError + 46, , "Source candidate length changed."
     sheetA = ProjectPoint(a): sheetB = ProjectPoint(b)
-    box = selectedBody.GetBodyBox
-    If HasItems(box) = False Then Err.Raise vbObjectError + 47, , "Body box unavailable."
-    centre = Array((box(0) + box(3)) / 2#, (box(1) + box(4)) / 2#, (box(2) + box(5)) / 2#)
-    sheetCentre = ProjectPoint(centre)
+    PreparePlacementSupport
     Dim height As Double, halfWidth As Double, x As Double, y As Double
     height = 0.004: halfWidth = EstimateHalfWidth(expectedLength, height)
     If FindPosition(halfWidth, height, x, y) = False Then Err.Raise vbObjectError + 48, , "No free local text slot for candidate."
@@ -510,6 +517,8 @@ Private Function TryCreateDimension(ByVal visible As SldWorks.Edge, ByVal source
     Set jobs(currentJob).CreatedDD = dd
     jobs(currentJob).TargetX = x: jobs(currentJob).TargetY = y
     jobs(currentJob).HalfWidth = halfWidth: jobs(currentJob).HalfHeight = height
+    jobs(currentJob).PlacementNX = placementNX: jobs(currentJob).PlacementNY = placementNY
+    jobs(currentJob).BodySupportMin = bodySupportMin: jobs(currentJob).BodySupportMax = bodySupportMax
     drawing.ClearSelection2 True
     LogLine "CREATED body=[" & selectedBody.Name & "]; value mm=" & actual * 1000# & "; text m=(" & p(0) & ", " & p(1) & ")"
     occupied.Add Array(CDbl(p(0)), CDbl(p(1)), halfWidth, height)
@@ -552,7 +561,7 @@ Private Sub FinalReport()
     resultWarning = (skipped > 0 Or failed > 0 Or unprocessed > 0 Or queueComplete = False)
     LogLine "END " & resultSummary & "; sum=" & (created + already + skipped + failed + unprocessed) & "; queue complete=" & queueComplete
     LogLine "EXISTING other/ignored=" & ignoredExisting & "; unresolved=" & unresolvedExisting & "; unknown-body barrier count=" & unknownExisting
-    LogLine "Placement uses estimated text rectangles; inspect geometry, extension lines and neighbouring views. No document saved."
+    LogLine "Estimated text rectangles are placed outside the measured body with a 5 mm gap; overlaps with other parts/dimensions are allowed. No document saved."
 End Sub
 
 Private Sub InspectExistingDimensions()
@@ -894,37 +903,120 @@ Private Function CommandAnnotation(ByVal ann As SldWorks.Annotation, ByVal x As 
     CommandAnnotation = p
 End Function
 
-Private Function FindPosition(ByVal halfWidth As Double, ByVal halfHeight As Double, ByRef x As Double, ByRef y As Double) As Boolean
-    Dim dx As Double, dy As Double, projected As Double, nx As Double, ny As Double
-    Dim mx As Double, my As Double, dot As Double, side As Long, level As Long, offset As Double
-    Dim shift As Long, t As Double
+Private Sub PreparePlacementSupport()
+    If placementReady Then Exit Sub
+    Dim dx As Double, dy As Double, projected As Double
     dx = sheetB(0) - sheetA(0): dy = sheetB(1) - sheetA(1)
     projected = Sqr(dx * dx + dy * dy)
-    If projected < 0.00001 Then Exit Function
-    nx = -dy / projected: ny = dx / projected
+    If projected < 0.00001 Then Err.Raise vbObjectError + 130, , "Projected length direction is degenerate."
+    placementNX = -dy / projected: placementNY = dx / projected
+    Dim origin As Variant, basisX As Variant, basisY As Variant, basisZ As Variant
+    origin = ProjectPoint(Array(0#, 0#, 0#))
+    basisX = ProjectPoint(Array(1#, 0#, 0#))
+    basisY = ProjectPoint(Array(0#, 1#, 0#))
+    basisZ = ProjectPoint(Array(0#, 0#, 1#))
+    Dim sx As Double, sy As Double, sz As Double, norm As Double
+    sx = placementNX * (basisX(0) - origin(0)) + placementNY * (basisX(1) - origin(1))
+    sy = placementNX * (basisY(0) - origin(0)) + placementNY * (basisY(1) - origin(1))
+    sz = placementNX * (basisZ(0) - origin(0)) + placementNY * (basisZ(1) - origin(1))
+    norm = Sqr(sx * sx + sy * sy + sz * sz)
+    If norm <= 0.000000000001 Then Err.Raise vbObjectError + 131, , "Body support direction is degenerate."
+    sx = sx / norm: sy = sy / norm: sz = sz / norm
+    Dim outX As Double, outY As Double, outZ As Double, extreme As Variant
+    If ApiBoolean(selectedBody.GetExtremePoint(sx, sy, sz, outX, outY, outZ)) = False Then _
+        Err.Raise vbObjectError + 132, , "Positive body support unavailable."
+    extreme = ProjectPoint(Array(outX, outY, outZ))
+    bodySupportMax = placementNX * extreme(0) + placementNY * extreme(1)
+    If ApiBoolean(selectedBody.GetExtremePoint(-sx, -sy, -sz, outX, outY, outZ)) = False Then _
+        Err.Raise vbObjectError + 133, , "Negative body support unavailable."
+    extreme = ProjectPoint(Array(outX, outY, outZ))
+    bodySupportMin = placementNX * extreme(0) + placementNY * extreme(1)
+    If bodySupportMin > bodySupportMax Then Err.Raise vbObjectError + 134, , "Body support interval is invalid."
+    placementReady = True
+    LogLine "BODY SUPPORT n=(" & placementNX & ", " & placementNY & "); min/max m=(" & bodySupportMin & ", " & bodySupportMax & ")"
+End Sub
+
+Private Function FindPosition(ByVal halfWidth As Double, ByVal halfHeight As Double, ByRef x As Double, ByRef y As Double) As Boolean
+    PreparePlacementSupport
+    Dim mx As Double, my As Double, radius As Double, side As Long, target As Double
+    Dim candidateX As Double, candidateY As Double, distance As Double, bestDistance As Double
+    Dim left As Double, right As Double, bottom As Double, top As Double
+    left = SHEET_MARGIN_M + halfWidth: right = sheetWidth - SHEET_MARGIN_M - halfWidth
+    bottom = SHEET_MARGIN_M + halfHeight: top = sheetHeight - SHEET_MARGIN_M - halfHeight
+    If left > right Or bottom > top Then Exit Function
     mx = (sheetA(0) + sheetB(0)) / 2#: my = (sheetA(1) + sheetB(1)) / 2#
-    dot = (mx - sheetCentre(0)) * nx + (my - sheetCentre(1)) * ny
-    If dot < 0 Then nx = -nx: ny = -ny
-    For level = 0 To 6
-        offset = 0.006 + level * 0.002
-        For shift = 0 To 4
-            Select Case shift
-                Case 0: t = 0.5
-                Case 1: t = 0.35
-                Case 2: t = 0.65
-                Case 3: t = 0.2
-                Case Else: t = 0.8
-            End Select
-            mx = sheetA(0) + t * dx: my = sheetA(1) + t * dy
-            For side = 1 To -1 Step -2
-                x = mx + side * nx * offset: y = my + side * ny * offset
-                If PositionFits(x, y, halfWidth, halfHeight) Then
-                    FindPosition = True
-                    Exit Function
-                End If
-            Next side
-        Next shift
-    Next level
+    radius = Abs(placementNX) * halfWidth + Abs(placementNY) * halfHeight
+    For side = 1 To -1 Step -2
+        If side = 1 Then
+            target = bodySupportMax + BODY_TEXT_GAP_M + radius
+        Else
+            target = bodySupportMin - BODY_TEXT_GAP_M - radius
+        End If
+        If FindSidePosition(mx, my, placementNX, placementNY, target, side, left, right, bottom, top, candidateX, candidateY) Then
+            distance = (candidateX - mx) ^ 2 + (candidateY - my) ^ 2
+            If FindPosition = False Or distance < bestDistance Then
+                x = candidateX: y = candidateY: bestDistance = distance
+                FindPosition = True
+            End If
+        End If
+    Next side
+End Function
+
+Private Function FindSidePosition(ByVal mx As Double, ByVal my As Double, ByVal nx As Double, ByVal ny As Double, _
+        ByVal target As Double, ByVal side As Long, ByVal left As Double, ByVal right As Double, _
+        ByVal bottom As Double, ByVal top As Double, ByRef x As Double, ByRef y As Double) As Boolean
+    ' Nearest point in the inset sheet rectangle intersected with one outside half-plane.
+    x = ClampValue(mx, left, right): y = ClampValue(my, bottom, top)
+    If side * (nx * x + ny * y - target) >= -0.000000000001 Then
+        FindSidePosition = True
+        Exit Function
+    End If
+    Dim offset As Double, baseX As Double, baseY As Double, tx As Double, ty As Double
+    Dim low As Double, high As Double, shift As Double
+    offset = target - nx * mx - ny * my
+    baseX = mx + nx * offset: baseY = my + ny * offset
+    tx = -ny: ty = nx
+    low = -1E+30: high = 1E+30
+    If RestrictShift(baseX, tx, left, right, low, high) = False Then Exit Function
+    If RestrictShift(baseY, ty, bottom, top, low, high) = False Then Exit Function
+    shift = ClampValue(0#, low, high)
+    x = ClampValue(baseX + tx * shift, left, right)
+    y = ClampValue(baseY + ty * shift, bottom, top)
+    FindSidePosition = (side * (nx * x + ny * y - target) >= -0.000000000001)
+End Function
+
+Private Function RestrictShift(ByVal origin As Double, ByVal direction As Double, ByVal lower As Double, _
+        ByVal upper As Double, ByRef low As Double, ByRef high As Double) As Boolean
+    If Abs(direction) < 0.000000000001 Then
+        RestrictShift = (origin >= lower And origin <= upper)
+        Exit Function
+    End If
+    Dim a As Double, b As Double, swap As Double
+    a = (lower - origin) / direction: b = (upper - origin) / direction
+    If a > b Then swap = a: a = b: b = swap
+    If a > low Then low = a
+    If b < high Then high = b
+    If low > high Then
+        If low - high > 0.000000000001 Then Exit Function
+        low = (low + high) / 2#: high = low
+    End If
+    RestrictShift = True
+End Function
+
+Private Function ClampValue(ByVal value As Double, ByVal lower As Double, ByVal upper As Double) As Double
+    ClampValue = value
+    If value < lower Then ClampValue = lower
+    If value > upper Then ClampValue = upper
+End Function
+
+Private Function OutsideBodySupport(ByVal x As Double, ByVal y As Double, ByVal halfWidth As Double, _
+        ByVal halfHeight As Double, ByVal nx As Double, ByVal ny As Double, ByVal supportMin As Double, _
+        ByVal supportMax As Double) As Boolean
+    Dim centre As Double, radius As Double
+    centre = nx * x + ny * y
+    radius = Abs(nx) * halfWidth + Abs(ny) * halfHeight
+    OutsideBodySupport = (centre - radius >= supportMax + BODY_TEXT_GAP_M - 0.000000000001 Or _
+        centre + radius <= supportMin - BODY_TEXT_GAP_M + 0.000000000001)
 End Function
 
 Private Sub ResolveContext(ByVal selectedEdge As SldWorks.Edge)
@@ -1057,12 +1149,8 @@ End Function
 Private Function PositionFits(ByVal x As Double, ByVal y As Double, ByVal halfWidth As Double, ByVal halfHeight As Double) As Boolean
     If x - halfWidth < SHEET_MARGIN_M Or x + halfWidth > sheetWidth - SHEET_MARGIN_M Then Exit Function
     If y - halfHeight < SHEET_MARGIN_M Or y + halfHeight > sheetHeight - SHEET_MARGIN_M Then Exit Function
-    Dim rectangle As Variant
-    For Each rectangle In occupied
-        If Abs(x - rectangle(0)) < halfWidth + rectangle(2) + 0.001 And _
-            Abs(y - rectangle(1)) < halfHeight + rectangle(3) + 0.001 Then Exit Function
-    Next rectangle
-    PositionFits = True
+    If placementReady = False Then Exit Function
+    PositionFits = OutsideBodySupport(x, y, halfWidth, halfHeight, placementNX, placementNY, bodySupportMin, bodySupportMax)
 End Function
 
 Private Function RestorePreference() As Boolean
@@ -1545,10 +1633,13 @@ Private Sub ValidateRetainedDimension(ByVal index As Long)
     If dangling Or overridden Then Err.Raise vbObjectError + 113, , "New dimension is dangling or overridden during final validation."
     If Abs(p(0) - jobs(index).TargetX) > POSITION_TOL_M Or Abs(p(1) - jobs(index).TargetY) > POSITION_TOL_M Then _
         Err.Raise vbObjectError + 114, , "New text position changed during final validation."
-    ' Do not collision-test against our OWN occupied rectangle after reservation.
+    ' Final validation uses this body's saved support, never the current candidate's cache.
     If p(0) - jobs(index).HalfWidth < SHEET_MARGIN_M Or p(0) + jobs(index).HalfWidth > sheetWidth - SHEET_MARGIN_M Or _
         p(1) - jobs(index).HalfHeight < SHEET_MARGIN_M Or p(1) + jobs(index).HalfHeight > sheetHeight - SHEET_MARGIN_M Then _
         Err.Raise vbObjectError + 115, , "New text estimate is outside sheet during final validation."
+    If OutsideBodySupport(CDbl(p(0)), CDbl(p(1)), jobs(index).HalfWidth, jobs(index).HalfHeight, _
+        jobs(index).PlacementNX, jobs(index).PlacementNY, jobs(index).BodySupportMin, jobs(index).BodySupportMax) = False Then _
+        Err.Raise vbObjectError + 135, , "New text estimate is not outside its measured body with the required gap."
     jobs(index).Reason = "True cut-list LENGTH, XY and non-dangling annotation verified; view style unchanged."
     Exit Sub
 Invalid:
