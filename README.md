@@ -1,38 +1,15 @@
-# autosize — инструкции Codex
+# autosize
 
-Репозиторий подготовлен для разработки автоматизации размеров в SolidWorks 2025.
+SolidWorks 2025 VBA: длины тел выбранной многотельной детали рамы.
 
-- [AGENTS.md](AGENTS.md) — точка входа нового чата.
-- [engineering-knowledge/AGENTS.md](engineering-knowledge/AGENTS.md) — правила координатора.
-- [.codex/config.toml](.codex/config.toml) — три роли: Coder, API Expert, Debugger.
-- [engineering-knowledge/agents](engineering-knowledge/agents/) — инструкции подагентов.
-- [engineering-knowledge/topics/agent-setup.md](engineering-knowledge/topics/agent-setup.md) — когда привлекать агентов.
-- [engineering-knowledge/CHAT_START.md](engineering-knowledge/CHAT_START.md) — промпт для нового чата.
+Единственный исходник — `FrameCutListDimensionsV2.bas` v2.2, последняя версия
+с подтверждённым запуском: 17 из 19 размеров. Два тела (340 и 270 мм)
+пропущены из-за общего лимита подготовки 30 секунд.
 
-Не считать, что код, архивы или инженерная база репозитория Macro автоматически
-доступны здесь.
+Импортируйте модуль со ссылками SldWorks и SwConst, выполните **Debug → Compile**.
+На копии чертежа выберите одну кромку самой рамы и запустите
+`FrameCutListDimensionsV2.main`. Тип размеров вида — True / Истинный;
+конфигурации исходной детали и экземпляра должны совпадать.
+Журнал сохраняется в TEMP, путь показывается по завершении.
 
-## Макросы размеров рамы
-
-- [FrameCutListDimensionsV3](FrameCutListDimensionsV3.README.md) — новая версия
-  с кэшем продольных рёбер: устраняет повторный обход граней, из-за которого
-  две трубы не успели обработаться в V2.2. Требует нативной проверки.
-- [FrameCutListDimensionsV2](FrameCutListDimensionsV2.README.md) — сохранённая массовая
-  версия 2.2: рабочая логика швеллеров/уголков и ограниченный однократный поиск
-  границ скруглений труб непосредственно в исходных телах.
-  Нативный запуск V2.2 создал 17 размеров из 19; два тела пропущены по лимиту времени.
-- [FrameTubeDimensionTrial](FrameTubeDimensionTrial.README.md) — проверка одной
-  продольной кромки профильной трубы возле скругления; размер 1500 мм подтверждён.
-- [FrameCutListDimensions](FrameCutListDimensions.README.md) — массовая расстановка
-  по телам выбранной детали рамы; швеллеры и уголки проверены, для пропущенных труб
-  подготовлена отдельная проба выше.
-- [FrameCutListDimensionTrial](FrameCutListDimensionTrial.README.md) — подтверждённая
-  одиночная проба размера и размещения в изометрическом виде.
-- [FrameCutListProbe](FrameCutListProbe.README.md) — диагностика списка вырезов
-  и выбранного компонента без создания размеров.
-
-[Размещение в свободном пространстве](docs/empty-space-dimension-placement.md) —
-исследование API; новая компоновка пока не реализована.
-
-Старый `AutoDimensionFrame` 2.4.3 сохранён как предыдущая реализация; для уточнённой
-задачи «только тела выбранной детали рамы» используйте новые модули выше.
+Инструкции: [AGENTS.md](AGENTS.md). Настройки ролей: `.codex/config.toml`.
