@@ -14,8 +14,11 @@
 
 ## Макросы размеров рамы
 
+- [FrameTubeDimensionTrial](FrameTubeDimensionTrial.README.md) — проверка одной
+  продольной кромки профильной трубы возле скругления.
 - [FrameCutListDimensions](FrameCutListDimensions.README.md) — массовая расстановка
-  по телам списка вырезов выбранной детали рамы; требует проверки запуском в SolidWorks.
+  по телам выбранной детали рамы; швеллеры и уголки проверены, для пропущенных труб
+  подготовлена отдельная проба выше.
 - [FrameCutListDimensionTrial](FrameCutListDimensionTrial.README.md) — подтверждённая
   одиночная проба размера и размещения в изометрическом виде.
 - [FrameCutListProbe](FrameCutListProbe.README.md) — диагностика списка вырезов
