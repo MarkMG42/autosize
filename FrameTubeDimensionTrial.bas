@@ -5,7 +5,7 @@ Option Explicit
 ' body; the macro finds a visible full-length plane/cylinder boundary after
 ' temporarily showing tangent edges. Original view mode/settings are restored.
 ' Standard SldWorks/SwConst only. No rebuild, model edit, override or save.
-Private Const PREFIX As String = "FrameTubeDimensionTrial v1.2"
+Private Const PREFIX As String = "FrameTubeDimensionTrial v1.3"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
@@ -25,6 +25,7 @@ Private frameModel As SldWorks.ModelDoc2
 Private frameInstance As SldWorks.Component2
 Private frameDrawingComponent As SldWorks.Component2
 Private selectedBody As SldWorks.Body2
+Private supportFace As SldWorks.Face2
 Private visited As Collection, occupied As Collection
 Private output As Object
 Private outputPath As String
@@ -43,7 +44,7 @@ Public Sub main()
     CloseLog
     Set drawing = Nothing: Set view = Nothing: Set frameModel = Nothing
     Set frameInstance = Nothing: Set frameDrawingComponent = Nothing
-    Set selectedBody = Nothing: Set matchedFolder = Nothing
+    Set selectedBody = Nothing: Set matchedFolder = Nothing: Set supportFace = Nothing
     Set visited = New Collection: Set occupied = New Collection
     Erase candidates
     candidateCount = 0: folderMatches = 0: expectedLength = 0#
@@ -97,6 +98,7 @@ Public Sub main()
     If silhouetteSeed Then
         If Not TypeOf converted Is SldWorks.Face2 Then Err.Raise vbObjectError + 32, , "Silhouette face did not map to a source Face2."
         Set identifyingFace = converted
+        Set supportFace = identifyingFace
         Set selectedBody = identifyingFace.GetBody
     Else
         If Not TypeOf converted Is SldWorks.Edge Then Err.Raise vbObjectError + 32, , "Selected edge did not map to a source Edge."
@@ -127,7 +129,9 @@ Public Sub main()
         Err.Raise vbObjectError + 37, , "Cannot enable visible tangent edges."
     drawing.GraphicsRedraw2
     CollectBoundaries "after tangent edges visible", True
-    If candidateCount = 0 Then Err.Raise vbObjectError + 38, , "No visible full-LENGTH straight plane/cylinder boundary of the selected body."
+    If candidateCount = 0 Then CollectSupportFaceBoundaries
+    If candidateCount = 0 Then Err.Raise vbObjectError + 38, , _
+        "No full-LENGTH plane/cylinder boundary in displayed edges or the selected silhouette's source cylinder face."
     Dim drawingDoc As SldWorks.DrawingDoc, sheet As SldWorks.Sheet
     Set drawingDoc = drawing
     Set sheet = drawingDoc.GetCurrentSheet
@@ -250,11 +254,20 @@ Private Function EligibleBoundary(ByVal visible As SldWorks.Edge, ByRef source A
     On Error GoTo NotEligible
     ' The visible edge's curve classification is deliberately NOT used: only
     ' its real source counterpart supplies the authoritative geometry.
-    Dim converted As Object, body As SldWorks.Body2, length As Double, projectedA As Variant, projectedB As Variant
+    Dim converted As Object
     Set converted = frameModel.Extension.GetCorrespondingEntity2(visible)
     If converted Is Nothing Then Exit Function
     If Not TypeOf converted Is SldWorks.Edge Then Exit Function
     Set source = converted
+    EligibleBoundary = EligibleSourceBoundary(source, a, b, score)
+    Exit Function
+NotEligible:
+    LogLine "BOUNDARY rejected by API/geometry: " & Err.Number & ": " & Err.Description
+End Function
+
+Private Function EligibleSourceBoundary(ByVal source As SldWorks.Edge, _
+        ByRef a As Variant, ByRef b As Variant, ByRef score As Double) As Boolean
+    Dim body As SldWorks.Body2, length As Double, projectedA As Variant, projectedB As Variant
     Set body = source.GetBody
     If body Is Nothing Then Exit Function
     If app.IsSame(body, selectedBody) <> swObjectSame Then Exit Function
@@ -265,10 +278,103 @@ Private Function EligibleBoundary(ByVal visible As SldWorks.Edge, ByRef source A
     projectedA = ProjectPoint(a): projectedB = ProjectPoint(b)
     If Sqr((projectedB(0) - projectedA(0)) ^ 2 + (projectedB(1) - projectedA(1)) ^ 2) < 0.00001 Then Exit Function
     score = RadialScore(a, b, length)
-    EligibleBoundary = True
-    Exit Function
-NotEligible:
-    LogLine "BOUNDARY rejected by API/geometry: " & Err.Number & ": " & Err.Description
+    EligibleSourceBoundary = True
+End Function
+
+Private Sub CollectSupportFaceBoundaries()
+    ' GetVisibleEntities2 can omit tangent boundaries. This fallback is limited
+    ' to the exact source face underlying the picked silhouette, NOT Body.GetEdges.
+    If supportFace Is Nothing Then
+        LogLine "SOURCE FACE fallback unavailable: select a longitudinal silhouette on the tube's rounded corner"
+        Exit Sub
+    End If
+    Dim body As SldWorks.Body2, surface As SldWorks.Surface, cylinder As Boolean
+    Set body = supportFace.GetBody
+    If body Is Nothing Then Err.Raise vbObjectError + 101, , "Supporting face has no body."
+    If app.IsSame(body, selectedBody) <> swObjectSame Then Err.Raise vbObjectError + 102, , "Supporting face belongs to a different body."
+    Set surface = supportFace.GetSurface
+    If surface Is Nothing Then Err.Raise vbObjectError + 103, , "Supporting surface unavailable."
+    cylinder = ApiBoolean(surface.IsCylinder)
+    LogLine "SOURCE FACE fallback: same target body confirmed; cylinder=" & cylinder & "; individual edge visibility NOT established"
+    If cylinder = False Then Exit Sub
+    Dim edges As Variant, i As Long, source As SldWorks.Edge, mapped As SldWorks.Edge
+    Dim a As Variant, b As Variant, score As Double, length As Double, dot As Double
+    Dim axisX As Double, axisY As Double, axisZ As Double, matched As Long
+    edges = supportFace.GetEdges
+    If HasItems(edges) = False Then Exit Sub
+    For i = LBound(edges) To UBound(edges)
+        Set source = edges(i)
+        If EligibleSourceBoundary(source, a, b, score) Then
+            If EdgeHasSupportFace(source) Then
+                length = Sqr((b(0) - a(0)) ^ 2 + (b(1) - a(1)) ^ 2 + (b(2) - a(2)) ^ 2)
+                If matched = 0 Then
+                    axisX = (b(0) - a(0)) / length: axisY = (b(1) - a(1)) / length: axisZ = (b(2) - a(2)) / length
+                Else
+                    dot = ((b(0) - a(0)) * axisX + (b(1) - a(1)) * axisY + (b(2) - a(2)) * axisZ) / length
+                    If Abs(dot) < 0.99999 Then Err.Raise vbObjectError + 104, , "Supporting face has ambiguous full-LENGTH edge directions."
+                End If
+                matched = matched + 1
+                Set mapped = MapSourceBoundaryToView(source)
+                If Not mapped Is Nothing Then
+                    candidateCount = candidateCount + 1
+                    If candidateCount = 1 Then
+                        ReDim candidates(1 To 1)
+                    Else
+                        ReDim Preserve candidates(1 To candidateCount)
+                    End If
+                    Set candidates(candidateCount).Visible = mapped
+                    Set candidates(candidateCount).Source = source
+                    candidates(candidateCount).Score = score
+                    LogLine "SOURCE FACE boundary candidate=" & candidateCount & "; source edge index=" & i & "; radial score m2=" & score
+                End If
+            End If
+        End If
+    Next i
+    LogLine "SOURCE FACE edges=" & (UBound(edges) - LBound(edges) + 1) & "; full-LENGTH boundaries=" & matched & _
+        "; selectable context candidates=" & candidateCount & "; no displayed-edge visibility claim"
+End Sub
+
+Private Function EdgeHasSupportFace(ByVal edge As SldWorks.Edge) As Boolean
+    Dim faces As Variant, face As SldWorks.Face2, i As Long
+    faces = edge.GetTwoAdjacentFaces2
+    If HasItems(faces) = False Then Exit Function
+    For i = LBound(faces) To UBound(faces)
+        Set face = faces(i)
+        If Not face Is Nothing Then
+            If app.IsSame(face, supportFace) = swObjectSame Then
+                EdgeHasSupportFace = True
+                Exit Function
+            End If
+        End If
+    Next i
+End Function
+
+Private Function MapSourceBoundaryToView(ByVal source As SldWorks.Edge) As SldWorks.Edge
+    Dim modelEntity As Object, drawingEntity As Object
+    If frameInstance Is Nothing Then
+        Set modelEntity = source
+    Else
+        Set modelEntity = frameInstance.GetCorresponding(source)
+    End If
+    If modelEntity Is Nothing Then
+        LogLine "SOURCE FACE boundary has no corresponding entity in the selected instance"
+        Exit Function
+    End If
+    If Not TypeOf modelEntity Is SldWorks.Edge Then Exit Function
+    Set drawingEntity = view.GetCorresponding(modelEntity)
+    If Not drawingEntity Is Nothing Then
+        If TypeOf drawingEntity Is SldWorks.Edge Then
+            Set MapSourceBoundaryToView = drawingEntity
+            Exit Function
+        End If
+        LogLine "SOURCE FACE view correspondence returned a non-edge; candidate rejected"
+        Exit Function
+    End If
+    ' SelectEntity supports model-context entities in a specified view.
+    ' VerifySingleSelection must still prove view, actual instance and body
+    ' before the sole AddDimension2. A successful selection is not visibility.
+    Set MapSourceBoundaryToView = modelEntity
+    LogLine "SOURCE FACE using selected-instance model edge for view.SelectEntity; actual selection must be verified"
 End Function
 
 Private Function PlaneCylinderBoundary(ByVal edge As SldWorks.Edge) As Boolean
