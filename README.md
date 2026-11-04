@@ -14,10 +14,13 @@
 
 ## Макросы размеров рамы
 
-- [FrameCutListDimensionsV2](FrameCutListDimensionsV2.README.md) — новая массовая
+- [FrameCutListDimensionsV3](FrameCutListDimensionsV3.README.md) — новая версия
+  с кэшем продольных рёбер: устраняет повторный обход граней, из-за которого
+  две трубы не успели обработаться в V2.2. Требует нативной проверки.
+- [FrameCutListDimensionsV2](FrameCutListDimensionsV2.README.md) — сохранённая массовая
   версия 2.2: рабочая логика швеллеров/уголков и ограниченный однократный поиск
   границ скруглений труб непосредственно в исходных телах.
-  Версии 2.0/2.1 приводили к падению SolidWorks; новый путь требует нативной проверки.
+  Нативный запуск V2.2 создал 17 размеров из 19; два тела пропущены по лимиту времени.
 - [FrameTubeDimensionTrial](FrameTubeDimensionTrial.README.md) — проверка одной
   продольной кромки профильной трубы возле скругления; размер 1500 мм подтверждён.
 - [FrameCutListDimensions](FrameCutListDimensions.README.md) — массовая расстановка
