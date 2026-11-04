@@ -4,13 +4,16 @@ Option Explicit
 ' Bulk true lengths for cut-list bodies of ONE explicitly selected frame part.
 ' No other assembly components are dimensioned. No model saves/rebuilds,
 ' configuration switches or text/value overrides. Standard SldWorks/SwConst only.
-Private Const PREFIX As String = "FrameCutListDimensionsV2 v2.1"
+Private Const PREFIX As String = "FrameCutListDimensionsV2 v2.2"
 Private Const LENGTH_TOL_M As Double = 0.000001
 Private Const POSITION_TOL_M As Double = 0.00001
 Private Const CUTLIST_MM_TO_M As Double = 0.001
 Private Const SHEET_MARGIN_M As Double = 0.001
 Private Const MAX_EDGE_ATTEMPTS As Long = 8
 Private Const PROBE_STEP_M As Double = 0.001
+Private Const MAX_SOURCE_FACES As Long = 2000
+Private Const MAX_SOURCE_CANDIDATES As Long = 32
+Private Const SOURCE_PREP_BUDGET_S As Double = 30#
 Private Type BodyJob
     Body As SldWorks.Body2
     FolderName As String
@@ -51,7 +54,7 @@ Private blocked As Boolean, queueComplete As Boolean
 Private ignoredExisting As Long, unresolvedExisting As Long, unknownExisting As Long
 Private resultSummary As String, resultWarning As Boolean
 Private seedFace As SldWorks.Face2, supportFace As SldWorks.Face2
-Private supportFaces As Collection
+Private sourcePrepStarted As Double, sourcePrepTimedOut As Boolean
 Private sourceCentre As Variant
 Private currentJob As Long
 
@@ -61,7 +64,8 @@ Public Sub main()
     Set drawing = Nothing: Set view = Nothing: Set frameModel = Nothing
     Set frameInstance = Nothing: Set frameDrawingComponent = Nothing: Set selectedBody = Nothing
     Set seedFace = Nothing: Set supportFace = Nothing
-    Set visited = New Collection: Set occupied = New Collection: Set supportFaces = New Collection
+    Set visited = New Collection: Set occupied = New Collection
+    sourcePrepStarted = 0#: sourcePrepTimedOut = False
     Erase jobs
     jobCount = 0: currentJob = 0: preferenceCaptured = False
     blocked = False: queueComplete = False
@@ -131,7 +135,7 @@ Public Sub main()
                     ProcessBody i
                 Else
                     jobs(i).State = "skipped"
-                    jobs(i).Reason = "No usable full-LENGTH plane/cylinder boundary on accessible visible/seed support faces; no hidden whole-body fallback."
+                    jobs(i).Reason = "No usable full-LENGTH plane/cylinder boundary in this source cut-list body; visibility is not proven."
                 End If
             End If
         Next i
@@ -353,7 +357,7 @@ Private Sub ProcessBody(ByVal index As Long)
     currentJob = index
     If jobs(index).Visible.Count = 0 Then
         jobs(index).State = "skipped"
-        jobs(index).Reason = "No visible straight edge equals cut-list LENGTH; no hidden/shorter fallback."
+        jobs(index).Reason = "No verified full-LENGTH candidate for this source cut-list body."
         Exit Sub
     End If
     Set selectedBody = jobs(index).Body
@@ -603,8 +607,23 @@ End Sub
 Private Function AttachmentSource(ByVal item As Object, ByRef localEntity As Object, _
         ByRef ownerKnown As Boolean, ByRef ownerOther As Boolean) As Long
     On Error GoTo Unconfirmed
+    ownerKnown = False: ownerOther = False
+    Set localEntity = Nothing
+    If item Is Nothing Then Exit Function
     ownerKnown = AttachmentOwner(item, ownerOther)
     If ownerOther Then Exit Function
+    If TypeOf item Is SldWorks.Edge Then
+        Dim attachedEdge As SldWorks.Edge, attachedCurve As SldWorks.Curve
+        Dim attachedLine As Boolean
+        Set attachedEdge = item
+        Set attachedCurve = attachedEdge.GetCurve
+        If attachedCurve Is Nothing Then Exit Function
+        attachedLine = ApiBoolean(attachedCurve.IsLine)
+        If attachedLine = False Then
+            LogLine "EXISTING curved edge attachment unsupported; reverse correspondence not called"
+            Exit Function
+        End If
+    End If
     Set localEntity = frameModel.Extension.GetCorrespondingEntity2(item)
     If localEntity Is Nothing Then Exit Function
     Dim body As SldWorks.Body2
@@ -1234,26 +1253,6 @@ Private Sub ResolveSilhouetteContext(ByVal face As SldWorks.Face2, _
     LogLine "FRAME MODEL=[" & frameModel.GetTitle & "]; path=[" & frameModel.GetPathName & "]"
 End Sub
 
-Private Function FaceBodyIsInTargetPart(ByVal face As SldWorks.Face2) As Boolean
-    Dim body As SldWorks.Body2, candidate As SldWorks.Body2, part As SldWorks.PartDoc
-    Dim bodies As Variant, i As Long, matches As Long
-    If face Is Nothing Then Exit Function
-    If frameModel Is Nothing Then Exit Function
-    If frameModel.GetType <> swDocPART Then Exit Function
-    Set body = face.GetBody
-    If body Is Nothing Then Exit Function
-    Set part = frameModel
-    bodies = part.GetBodies2(swSolidBody, False)
-    If HasItems(bodies) = False Then Exit Function
-    For i = LBound(bodies) To UBound(bodies)
-        Set candidate = bodies(i)
-        If Not candidate Is Nothing Then
-            If app.IsSame(body, candidate) = swObjectSame Then matches = matches + 1
-        End If
-    Next i
-    LogLine "SILHOUETTE local-face body identity matches in target part=" & matches
-    FaceBodyIsInTargetPart = (matches = 1)
-End Function
 
 Private Function MapSourceBoundaryToView(ByVal source As SldWorks.Edge) As SldWorks.Edge
     Dim modelEntity As Object, drawingEntity As Object
@@ -1280,7 +1279,6 @@ Private Function MapSourceBoundaryToView(ByVal source As SldWorks.Edge) As SldWo
     ' VerifySingleSelection must still prove view, actual instance and body
     ' before the sole AddDimension2. A successful selection is not visibility.
     Set MapSourceBoundaryToView = modelEntity
-    LogLine "SOURCE FACE using selected-instance model edge for view.SelectEntity; actual selection must be verified"
 End Function
 
 Private Function PlaneCylinderBoundary(ByVal edge As SldWorks.Edge) As Boolean
@@ -1349,111 +1347,44 @@ Private Function NeedSupportPhase() As Boolean
 End Function
 
 Private Sub DiscoverSupportFaces()
-    ' Discover adjacent source cylinder faces from ALL real visible edges.
-    ' Short/curved edges identify faces only; only verified full LENGTH edges
-    ' of those faces can later be selected for dimension creation.
-    On Error GoTo Unavailable
-    Dim edges As Variant, i As Long, item As Object, count As Long
-    LogLine "BEGIN support discovery GetVisibleEntities2 Edge1; target frame component only; before creation"
-    edges = view.GetVisibleEntities2(frameDrawingComponent, swViewEntityType_Edge)
-    LogLine "DONE support discovery GetVisibleEntities2 Edge1"
-    If HasItems(edges) Then
-        count = UBound(edges) - LBound(edges) + 1
-        For i = LBound(edges) To UBound(edges)
-            Set item = edges(i)
-            If TypeOf item Is SldWorks.Edge Then DiscoverAdjacentSupportFaces item, i
-        Next i
-    End If
-    LogLine "SOURCE FACE discovery real visible edges=" & count
-    If Not seedFace Is Nothing Then AcceptSupportFace seedFace, "selected silhouette seed"
-    LogLine "SOURCE FACE unique accessible cylindrical support faces=" & supportFaces.Count
+    ' SOURCE ONLY. No drawing-edge reverse mapping or visibility queries here.
+    ' Every face is obtained directly from its queued source cut-list body.
+    sourcePrepStarted = Timer
+    sourcePrepTimedOut = False
+    LogLine "SOURCE PREPARATION source cut-list geometry only; face cap=" & MAX_SOURCE_FACES & _
+        "; retained candidates/body=" & MAX_SOURCE_CANDIDATES & "; budget seconds=" & SOURCE_PREP_BUDGET_S & "; visibility NOT proven"
+    Dim i As Long
     For i = 1 To jobCount
-        If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then _
-            LogLine "SOURCE FACE body=[" & jobs(i).Body.Name & "]; selectable real boundary candidates=" & jobs(i).Source.Count
-    Next i
-    Exit Sub
-Unavailable:
-    LogLine "SOURCE FACE real-edge discovery unavailable: " & Err.Number & ": " & Err.Description
-    If Not seedFace Is Nothing Then AcceptSupportFace seedFace, "selected silhouette seed after visible-edge discovery error"
-End Sub
-
-
-
-Private Sub AcceptSupportFace(ByVal face As SldWorks.Face2, ByVal origin As String)
-    On Error GoTo Rejected
-    Dim converted As Object, source As SldWorks.Face2, body As SldWorks.Body2
-    Dim index As Long, i As Long, existing As SldWorks.Face2, surface As SldWorks.Surface
-    LogLine "BEGIN support face reverse; " & origin
-    Set converted = frameModel.Extension.GetCorrespondingEntity2(face)
-    LogLine "DONE support face reverse; " & origin
-    If converted Is Nothing Then
-        If FaceBodyIsInTargetPart(face) Then
-            Set converted = face
-            LogLine "SOURCE FACE reverse returned Nothing; exact target-part body identity confirmed"
-        End If
-    End If
-    If converted Is Nothing Then Exit Sub
-    If Not TypeOf converted Is SldWorks.Face2 Then Exit Sub
-    Set source = converted
-    Set body = source.GetBody
-    If body Is Nothing Then Exit Sub
-    index = FindJobForBody(body)
-    If index = 0 Then Exit Sub
-    If jobs(index).State <> "pending" Or jobs(index).NormalCount <> 0 Then Exit Sub
-    ' Native body equality alone does not establish the face coordinate context.
-    ' Obtain the SAME face object from the canonical source body before reading
-    ' edges. This identity normalization does not discover additional faces.
-    Dim localFaces As Variant, localFace As SldWorks.Face2, canonical As SldWorks.Face2
-    Dim faceMatches As Long
-    LogLine "BEGIN canonical source-body face identity; body=[" & jobs(index).Body.Name & "]; " & origin
-    localFaces = jobs(index).Body.GetFaces
-    If HasItems(localFaces) Then
-        For i = LBound(localFaces) To UBound(localFaces)
-            Set localFace = localFaces(i)
-            If Not localFace Is Nothing Then
-                If app.IsSame(source, localFace) = swObjectSame Then
-                    faceMatches = faceMatches + 1
-                    Set canonical = localFace
-                End If
+        If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then
+            If SourcePrepBudgetExceeded Then
+                SkipUnpreparedSourceJobs i
+                Exit Sub
             End If
-        Next i
-    End If
-    LogLine "DONE canonical source-body face identity; body=[" & jobs(index).Body.Name & "]; matches=" & faceMatches & "; origin=" & origin
-    If faceMatches <> 1 Then
-        LogLine "SOURCE FACE rejected: canonical source-body face identity must match exactly once; no coordinate-context guess"
-        Exit Sub
-    End If
-    Set source = canonical
-    Set surface = source.GetSurface
-    If surface Is Nothing Then Exit Sub
-    If ApiBoolean(surface.IsCylinder) = False Then Exit Sub
-    For i = 1 To supportFaces.Count
-        Set existing = supportFaces(i)
-        If app.IsSame(existing, source) = swObjectSame Then Exit Sub
+            PrepareSourceBody i
+            If sourcePrepTimedOut Then
+                SkipUnpreparedSourceJobs i
+                Exit Sub
+            End If
+        End If
     Next i
-    supportFaces.Add source
-    Set supportFace = source
-    LogLine "SOURCE FACE accepted body=[" & body.Name & "]; origin=" & origin & "; native cylinder=True; boundary visibility NOT established"
-    CollectFaceEdges index, source
-    Exit Sub
-Rejected:
-    LogLine "SOURCE FACE rejected origin=" & origin & ": " & Err.Number & ": " & Err.Description
+    LogLine "SOURCE PREPARATION completed within budget"
 End Sub
 
-Private Sub CollectFaceEdges(ByVal index As Long, ByVal face As SldWorks.Face2)
+
+
+
+Private Sub CollectFaceEdges(ByVal index As Long, ByVal face As SldWorks.Face2, ByVal faceIndex As Long)
     Dim edges As Variant, i As Long, source As SldWorks.Edge, accepted As Long
-    LogLine "BEGIN canonical face GetEdges; body=[" & jobs(index).Body.Name & "]"
     edges = face.GetEdges
-    LogLine "DONE canonical face GetEdges; body=[" & jobs(index).Body.Name & "]"
     If HasItems(edges) = False Then Exit Sub
     For i = LBound(edges) To UBound(edges)
+        If SourcePrepBudgetExceeded Then Exit Sub
         Set source = edges(i)
-        LogLine "BEGIN face boundary geometry/adjacency; body=[" & jobs(index).Body.Name & "]; source edge index=" & i
         If AddFaceEdge(index, source) Then accepted = accepted + 1
-        LogLine "DONE face boundary geometry/adjacency; body=[" & jobs(index).Body.Name & "]; source edge index=" & i
     Next i
-    LogLine "SOURCE FACE body=[" & jobs(index).Body.Name & "]; real face edges=" & (UBound(edges) - LBound(edges) + 1) & _
-        "; added full-LENGTH boundaries=" & accepted
+    If SourcePrepBudgetExceeded Then Exit Sub
+    LogLine "SOURCE cylinder face body=[" & jobs(index).Body.Name & "]; face index=" & faceIndex & _
+        "; real edges=" & (UBound(edges) - LBound(edges) + 1) & "; accepted boundaries=" & accepted & "; retained=" & jobs(index).Source.Count
 End Sub
 
 Private Function AddFaceEdge(ByVal index As Long, ByVal source As SldWorks.Edge) As Boolean
@@ -1464,14 +1395,14 @@ Private Function AddFaceEdge(ByVal index As Long, ByVal source As SldWorks.Edge)
     Set body = source.GetBody
     If body Is Nothing Then Exit Function
     If FindJobForBody(body) <> index Then Exit Function
-    If StraightGeometry(source, a, b, length) = False Then Exit Function
-    If Abs(length - jobs(index).Expected) > LENGTH_TOL_M Then Exit Function
-    If PlaneCylinderBoundary(source) = False Then Exit Function
-    If EdgeHasSupportFace(source) = False Then Exit Function
     For i = 1 To jobs(index).Source.Count
         Set prior = jobs(index).Source(i)
         If app.IsSame(prior, source) = swObjectSame Then Exit Function
     Next i
+    If StraightGeometry(source, a, b, length) = False Then Exit Function
+    If Abs(length - jobs(index).Expected) > LENGTH_TOL_M Then Exit Function
+    If PlaneCylinderBoundary(source) = False Then Exit Function
+    If EdgeHasSupportFace(source) = False Then Exit Function
     pa = ProjectPoint(a): pb = ProjectPoint(b)
     dx = pb(0) - pa(0): dy = pb(1) - pa(1)
     If Sqr(dx * dx + dy * dy) < 0.00001 Then Exit Function
@@ -1497,8 +1428,12 @@ Private Function AddFaceEdge(ByVal index As Long, ByVal source As SldWorks.Edge)
         jobs(index).Visible.Add mapped
         jobs(index).Scores.Add score
     End If
-    LogLine "SOURCE FACE boundary body=[" & body.Name & "]; expected mm=" & jobs(index).Expected * 1000# & _
-        "; actual mm=" & length * 1000# & "; radial score m2=" & score & "; mapped model/view context; no visible-edge claim"
+    ' Collections remain aligned after descending-score insertion and trimming.
+    If jobs(index).Source.Count > MAX_SOURCE_CANDIDATES Then
+        jobs(index).Source.Remove jobs(index).Source.Count
+        jobs(index).Visible.Remove jobs(index).Visible.Count
+        jobs(index).Scores.Remove jobs(index).Scores.Count
+    End If
     AddFaceEdge = True
     Exit Function
 Rejected:
@@ -1555,32 +1490,85 @@ Invalid:
     End If
 End Sub
 
-Private Sub DiscoverAdjacentSupportFaces(ByVal visible As SldWorks.Edge, ByVal edgeIndex As Long)
-    On Error GoTo Unavailable
-    Dim converted As Object, source As SldWorks.Edge, body As SldWorks.Body2
-    Dim faces As Variant, face As SldWorks.Face2, index As Long, i As Long, context As String
-    context = "visible edge index=" & edgeIndex
-    LogLine "BEGIN support edge reverse; " & context
-    Set converted = frameModel.Extension.GetCorrespondingEntity2(visible)
-    LogLine "DONE support edge reverse; " & context
-    If converted Is Nothing Then Exit Sub
-    If Not TypeOf converted Is SldWorks.Edge Then Exit Sub
-    Set source = converted
-    Set body = source.GetBody
-    If body Is Nothing Then Exit Sub
-    index = FindJobForBody(body)
-    If index = 0 Then Exit Sub
-    If jobs(index).State <> "pending" Or jobs(index).NormalCount <> 0 Then Exit Sub
-    context = "body=[" & jobs(index).Body.Name & "]; visible edge index=" & edgeIndex
-    LogLine "BEGIN support source edge adjacency; " & context
-    faces = source.GetTwoAdjacentFaces2
-    LogLine "DONE support source edge adjacency; " & context
-    If HasItems(faces) = False Then Exit Sub
+
+Private Sub PrepareSourceBody(ByVal index As Long)
+    On Error GoTo Unsupported
+    Dim faces As Variant, face As SldWorks.Face2, owner As SldWorks.Body2
+    Dim surface As SldWorks.Surface, seen As Collection, previous As SldWorks.Face2
+    Dim i As Long, j As Long, count As Long, duplicate As Boolean, cylinders As Long
+    Set seen = New Collection
+    LogLine "BEGIN source Body.GetFaces; body=[" & jobs(index).Body.Name & "]"
+    faces = jobs(index).Body.GetFaces
+    If HasItems(faces) Then count = UBound(faces) - LBound(faces) + 1
+    LogLine "DONE source Body.GetFaces; body=[" & jobs(index).Body.Name & "]; faces=" & count
+    If count = 0 Then Err.Raise vbObjectError + 120, , "Source body has no accessible faces."
+    If count > MAX_SOURCE_FACES Then Err.Raise vbObjectError + 121, , "Source body exceeds the face cap; entire body skipped."
     For i = LBound(faces) To UBound(faces)
+        If SourcePrepBudgetExceeded Then Exit Sub
         Set face = faces(i)
-        If Not face Is Nothing Then AcceptSupportFace face, context & "; adjacent face index=" & i
+        If Not face Is Nothing Then
+            duplicate = False
+            For j = 1 To seen.Count
+                If SourcePrepBudgetExceeded Then Exit Sub
+                Set previous = seen(j)
+                If app.IsSame(previous, face) = swObjectSame Then
+                    duplicate = True
+                    Exit For
+                End If
+            Next j
+            If duplicate = False Then
+                seen.Add face
+                Set owner = face.GetBody
+                If owner Is Nothing Then Err.Raise vbObjectError + 122, , "Source face body unavailable."
+                If FindJobForBody(owner) <> index Then Err.Raise vbObjectError + 123, , "Source face is not owned by its queued body."
+                Set surface = face.GetSurface
+                If Not surface Is Nothing Then
+                    If ApiBoolean(surface.IsCylinder) Then
+                        cylinders = cylinders + 1
+                        Set supportFace = face
+                        CollectFaceEdges index, face, i
+                        If sourcePrepTimedOut Then Exit Sub
+                    End If
+                End If
+            End If
+        End If
     Next i
+    If SourcePrepBudgetExceeded Then Exit Sub
+    LogLine "SOURCE body prepared=[" & jobs(index).Body.Name & "]; unique faces=" & seen.Count & _
+        "; cylinder faces=" & cylinders & "; retained ranked candidates=" & jobs(index).Source.Count & "; visibility NOT proven"
     Exit Sub
-Unavailable:
-    LogLine "SOURCE FACE edge discovery rejected; " & context & ": " & Err.Number & ": " & Err.Description
+Unsupported:
+    jobs(index).State = "skipped"
+    jobs(index).Reason = "Source-only tube preparation unsupported: " & Err.Description
+    ClearSourceCandidates index
+    LogLine "SOURCE body skipped=[" & jobs(index).Body.Name & "]; " & jobs(index).Reason
+End Sub
+
+Private Function SourcePrepBudgetExceeded() As Boolean
+    Dim elapsed As Double
+    elapsed = Timer - sourcePrepStarted
+    If elapsed < 0# Then elapsed = elapsed + 86400#
+    If elapsed >= SOURCE_PREP_BUDGET_S Then
+        If sourcePrepTimedOut = False Then LogLine "SOURCE PREPARATION budget reached; elapsed seconds=" & elapsed
+        sourcePrepTimedOut = True
+    End If
+    SourcePrepBudgetExceeded = sourcePrepTimedOut
+End Function
+
+Private Sub SkipUnpreparedSourceJobs(ByVal first As Long)
+    Dim i As Long
+    For i = first To jobCount
+        If jobs(i).State = "pending" And jobs(i).NormalCount = 0 Then
+            ClearSourceCandidates i
+            jobs(i).State = "skipped"
+            jobs(i).Reason = "Source preparation time budget reached; partial candidates discarded, no legacy discovery fallback."
+            LogLine "SOURCE budget skip body=[" & jobs(i).Body.Name & "]"
+        End If
+    Next i
+End Sub
+
+Private Sub ClearSourceCandidates(ByVal index As Long)
+    Set jobs(index).Source = New Collection
+    Set jobs(index).Visible = New Collection
+    Set jobs(index).Scores = New Collection
 End Sub
